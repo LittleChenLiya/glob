@@ -1108,6 +1108,407 @@ impl MatchOptions {
     }
 }
 
+/// Whether a rule in a `PatternSet` includes or excludes the paths it matches.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum RuleKind {
+    /// Matching paths are selected into the result set.
+    Include,
+    /// Matching paths are removed from the result set.
+    Exclude,
+}
+
+/// How `PatternSet::walk` reacts to I/O errors while reading the filesystem.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ErrorPolicy {
+    /// Abort the walk and return the first error encountered.
+    Fail,
+    /// Record the error in `WalkOutcome::errors` and keep walking.
+    Report,
+}
+
+/// Options controlling matching and traversal behavior of a `PatternSet`.
+#[allow(missing_copy_implementations)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PatternSetOptions {
+    /// Whether rules are matched case-sensitively. Like
+    /// `MatchOptions::case_sensitive`, this only considers ASCII case.
+    pub case_sensitive: bool,
+
+    /// Whether directory symlinks are followed during traversal.
+    ///
+    /// When disabled (the default), symlinks are treated as leaf entries and
+    /// are never descended into. When enabled, loops are detected via the
+    /// canonical (real) identity of each visited directory, and links that
+    /// would escape the walk root are not followed.
+    pub follow_links: bool,
+
+    /// How I/O errors encountered while walking are handled.
+    pub error_policy: ErrorPolicy,
+}
+
+impl Default for PatternSetOptions {
+    fn default() -> Self {
+        Self {
+            case_sensitive: true,
+            follow_links: false,
+            error_policy: ErrorPolicy::Fail,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Rule {
+    kind: RuleKind,
+    pattern: Pattern,
+    /// A rule whose pattern ended in a path separator. Directory rules match
+    /// the directory itself and everything beneath it; plain (file) rules
+    /// only match the full path exactly.
+    dir_only: bool,
+}
+
+/// An ordered set of include/exclude rules sharing `Pattern` syntax.
+///
+/// Rules are applied in order and the *last* matching rule decides whether a
+/// path is included, so later rules can re-include paths excluded by earlier
+/// ones. Paths matched by no rule are excluded.
+///
+/// Paths are matched as root-relative, `/`-separated segment sequences, so
+/// results do not depend on the platform separator or the walk root absolute
+/// location. A rule whose pattern ends in a separator is a *directory rule*:
+/// it matches the named directory and everything beneath it. All other rules
+/// are *file rules* and match only the full relative path. This is the only
+/// special syntax; no other gitignore semantics (negation prefixes,
+/// anchoring, etc.) are implied.
+#[derive(Debug, Clone)]
+pub struct PatternSet {
+    rules: Vec<Rule>,
+    options: PatternSetOptions,
+}
+
+/// An error compiling one rule of a `PatternSet`.
+///
+/// Compilation is atomic: if any rule is invalid, no `PatternSet` is
+/// produced and no earlier rules take effect.
+#[derive(Debug)]
+#[allow(missing_copy_implementations)]
+pub struct PatternSetError {
+    /// The index of the offending rule in the original rule list.
+    pub rule_index: usize,
+
+    /// The original pattern text of the offending rule.
+    pub rule: String,
+
+    /// The underlying pattern error, including the character position.
+    pub error: PatternError,
+}
+
+impl Error for PatternSetError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl fmt::Display for PatternSetError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "invalid pattern in rule {} (\"{}\"): {}",
+            self.rule_index, self.rule, self.error
+        )
+    }
+}
+
+/// The result of evaluating a `PatternSet` against one relative path,
+/// without touching the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// Indices of every rule that matched the path, in rule order.
+    pub matched: Vec<usize>,
+
+    /// Index of the rule that decided the outcome (the last matching rule),
+    /// or `None` if no rule matched.
+    pub winner: Option<usize>,
+
+    /// Whether the path is included in the set.
+    pub included: bool,
+}
+
+/// A file selected by `PatternSet::walk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkMatch {
+    /// The full path to the file, including the walk root.
+    pub path: PathBuf,
+
+    /// The path relative to the walk root, as individual segments.
+    pub relative: Vec<String>,
+
+    /// Index of the rule that ultimately included this file.
+    pub winner: usize,
+
+    /// Indices of earlier matching rules whose decision was overridden by
+    /// the winner, in rule order.
+    pub overridden: Vec<usize>,
+}
+
+/// The result of walking a directory tree with a `PatternSet`.
+#[derive(Debug)]
+#[allow(missing_copy_implementations)]
+pub struct WalkOutcome {
+    /// Files selected by the rule set, in sorted traversal order.
+    pub matches: Vec<WalkMatch>,
+
+    /// I/O errors encountered while walking. Only populated when
+    /// `PatternSetOptions::error_policy` is `ErrorPolicy::Report`.
+    pub errors: Vec<GlobError>,
+}
+
+impl PatternSet {
+    /// Compile an ordered list of `(kind, pattern)` rules.
+    ///
+    /// Patterns use the same syntax as `Pattern::new`. A trailing path
+    /// separator marks a directory rule. If any rule fails to compile, the
+    /// returned error names that rule and the character position of the
+    /// problem, and no rules take effect.
+    pub fn compile(
+        rules: &[(RuleKind, &str)],
+        options: PatternSetOptions,
+    ) -> Result<PatternSet, PatternSetError> {
+        let mut compiled = Vec::with_capacity(rules.len());
+        for (rule_index, (kind, pattern)) in rules.iter().enumerate() {
+            let trimmed = pattern.trim_end_matches(path::is_separator);
+            let dir_only = trimmed.len() != pattern.len();
+            let pattern = Pattern::new(trimmed).map_err(|error| PatternSetError {
+                rule_index,
+                rule: pattern.to_string(),
+                error,
+            })?;
+            compiled.push(Rule {
+                kind: *kind,
+                pattern,
+                dir_only,
+            });
+        }
+        Ok(PatternSet {
+            rules: compiled,
+            options,
+        })
+    }
+
+    /// The match options derived from `PatternSetOptions::case_sensitive`.
+    /// Separators must always be matched literally so that `*` stays within
+    /// one path segment and only `**` crosses directories.
+    fn match_options(&self) -> MatchOptions {
+        MatchOptions {
+            case_sensitive: self.options.case_sensitive,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        }
+    }
+
+    /// Evaluate the rule set against a root-relative path given as segments,
+    /// without accessing the filesystem.
+    pub fn explain(&self, segments: &[&str]) -> Explanation {
+        let joined = segments.join("/");
+        let options = self.match_options();
+        let mut matched = Vec::new();
+        for (i, rule) in self.rules.iter().enumerate() {
+            let hits = if rule.dir_only {
+                // A directory rule matches the directory itself and any path
+                // beneath it, i.e. any prefix of the segment sequence.
+                (1..=segments.len())
+                    .any(|k| rule.pattern.matches_with(&segments[..k].join("/"), options))
+            } else {
+                rule.pattern.matches_with(&joined, options)
+            };
+            if hits {
+                matched.push(i);
+            }
+        }
+        let winner = matched.last().copied();
+        let included = winner.map_or(false, |w| self.rules[w].kind == RuleKind::Include);
+        Explanation {
+            matched,
+            winner,
+            included,
+        }
+    }
+
+    /// Walk the directory tree rooted at `root` and select the files
+    /// included by this rule set.
+    ///
+    /// Directories are never pruned just because a rule excludes them: a
+    /// later rule may re-include files beneath them. Only files are reported
+    /// as matches. Symlink handling is governed by
+    /// `PatternSetOptions::follow_links`.
+    pub fn walk(&self, root: &Path) -> Result<WalkOutcome, GlobError> {
+        let mut outcome = WalkOutcome {
+            matches: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut visited = std::collections::HashSet::new();
+        let root_canon = if self.options.follow_links {
+            let canon = fs::canonicalize(root).map_err(|error| GlobError {
+                path: root.to_path_buf(),
+                error,
+            })?;
+            visited.insert(canon.clone());
+            Some(canon)
+        } else {
+            None
+        };
+        self.walk_inner(
+            root,
+            root_canon.as_deref(),
+            &mut Vec::new(),
+            &mut visited,
+            &mut outcome,
+        )?;
+        Ok(outcome)
+    }
+
+    fn handle_io_error(
+        &self,
+        outcome: &mut WalkOutcome,
+        error: GlobError,
+    ) -> Result<(), GlobError> {
+        match self.options.error_policy {
+            ErrorPolicy::Fail => Err(error),
+            ErrorPolicy::Report => {
+                outcome.errors.push(error);
+                Ok(())
+            }
+        }
+    }
+
+    fn consider(&self, segments: &[String], path: &Path, outcome: &mut WalkOutcome) {
+        let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+        let explanation = self.explain(&refs);
+        if explanation.included {
+            let winner = explanation.winner.expect("included implies a winner");
+            let overridden = explanation.matched[..explanation.matched.len() - 1].to_vec();
+            outcome.matches.push(WalkMatch {
+                path: path.to_path_buf(),
+                relative: segments.to_vec(),
+                winner,
+                overridden,
+            });
+        }
+    }
+
+    fn walk_inner(
+        &self,
+        dir: &Path,
+        root_canon: Option<&Path>,
+        segments: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<PathBuf>,
+        outcome: &mut WalkOutcome,
+    ) -> Result<(), GlobError> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return self.handle_io_error(
+                    outcome,
+                    GlobError {
+                        path: dir.to_path_buf(),
+                        error,
+                    },
+                );
+            }
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => children.push(entry),
+                Err(error) => {
+                    self.handle_io_error(
+                        outcome,
+                        GlobError {
+                            path: dir.to_path_buf(),
+                            error,
+                        },
+                    )?;
+                }
+            }
+        }
+        children.sort_by_key(|e| e.file_name());
+        for child in children {
+            let path = child.path();
+            let file_type = match child.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    self.handle_io_error(outcome, GlobError { path, error })?;
+                    continue;
+                }
+            };
+            // FIXME (#9639): This needs to handle non-utf8 paths
+            segments.push(child.file_name().to_string_lossy().into_owned());
+            let result = if file_type.is_symlink() && self.options.follow_links {
+                self.walk_symlink(&path, root_canon, segments, visited, outcome)
+            } else if file_type.is_dir() {
+                // Never prune an excluded directory: a later rule may
+                // re-include files beneath it.
+                self.walk_inner(&path, root_canon, segments, visited, outcome)
+            } else {
+                // Regular files, and symlinks when not following them, are
+                // leaves that may be selected by the rule set.
+                self.consider(segments, &path, outcome);
+                Ok(())
+            };
+            segments.pop();
+            result?;
+        }
+        Ok(())
+    }
+
+    fn walk_symlink(
+        &self,
+        path: &Path,
+        root_canon: Option<&Path>,
+        segments: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<PathBuf>,
+        outcome: &mut WalkOutcome,
+    ) -> Result<(), GlobError> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return self.handle_io_error(
+                    outcome,
+                    GlobError {
+                        path: path.to_path_buf(),
+                        error,
+                    },
+                );
+            }
+        };
+        if !metadata.is_dir() {
+            self.consider(segments, path, outcome);
+            return Ok(());
+        }
+        let canon = match fs::canonicalize(path) {
+            Ok(canon) => canon,
+            Err(error) => {
+                return self.handle_io_error(
+                    outcome,
+                    GlobError {
+                        path: path.to_path_buf(),
+                        error,
+                    },
+                );
+            }
+        };
+        // Use the real (canonical) identity of the directory to detect
+        // loops, and refuse to follow links that escape the walk root.
+        let inside_root = root_canon.map_or(true, |root| canon.starts_with(root));
+        if inside_root && visited.insert(canon.clone()) {
+            let result = self.walk_inner(path, root_canon, segments, visited, outcome);
+            visited.remove(&canon);
+            result
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::{glob, MatchOptions, Pattern};
