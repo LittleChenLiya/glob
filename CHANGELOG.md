@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `glob_rooted`/`glob_rooted_with`: recursive scanning bounded to a root
+  directory, with caller-visible relative paths, optional following of links
+  that resolve inside the root, per-ancestor-chain loop detection, depth
+  limits, and distinguishable error items
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))

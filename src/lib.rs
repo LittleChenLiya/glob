@@ -496,6 +496,348 @@ impl Iterator for Paths {
     }
 }
 
+/// How symbolic links are treated during a rooted recursive scan.
+///
+/// See [`glob_rooted_with`] for details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FollowLinks {
+    /// Never follow symbolic links. Every link is reported as a leaf path,
+    /// exactly as the caller sees it, and its target is never inspected.
+    Never,
+    /// Follow a symbolic link only when its fully resolved target still lies
+    /// inside the scan root. The containment check is performed component by
+    /// component on the canonicalized paths, so a sibling directory whose
+    /// name merely starts with the root's name is *not* considered inside.
+    ///
+    /// Note that this is a static scope check against the filesystem tree at
+    /// scan time. It does not protect against filesystem changes made after
+    /// the check, such as a symlink being retargeted between the check and a
+    /// subsequent access.
+    WithinRoot,
+}
+
+/// Options controlling a rooted recursive scan started by [`glob_rooted_with`].
+#[derive(Debug, Clone)]
+pub struct RootedOptions {
+    /// Match options applied to the pattern, with the same semantics as
+    /// [`Pattern::matches_path_with`]: `case_sensitive`, hidden files
+    /// (`require_literal_leading_dot`) and separator handling
+    /// (`require_literal_separator`) behave exactly as they do for the
+    /// existing matcher. No option is overridden.
+    pub match_options: MatchOptions,
+    /// Whether and how symbolic links are followed.
+    pub follow_links: FollowLinks,
+    /// Maximum depth of the walk, counted in components of the logical
+    /// (as seen by the caller) path relative to the root. Direct children of
+    /// the root are at depth 1. `None` means no limit.
+    pub max_depth: Option<usize>,
+}
+
+impl RootedOptions {
+    /// Constructs a new `RootedOptions` with default field values:
+    /// default match options, [`FollowLinks::Never`] and no depth limit.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for RootedOptions {
+    fn default() -> Self {
+        RootedOptions {
+            match_options: MatchOptions::new(),
+            follow_links: FollowLinks::Never,
+            max_depth: None,
+        }
+    }
+}
+
+/// Return an iterator that recursively scans the directory tree rooted at
+/// `root` for paths matching `pattern`, using default rooted options
+/// (symlinks are not followed, no depth limit).
+///
+/// This may return an error if the pattern is invalid.
+///
+/// Unlike [`glob`], the returned paths are relative to `root` and are
+/// expressed exactly as the caller sees them (i.e. through whichever
+/// symbolic-link aliases were traversed). See [`glob_rooted_with`] for the
+/// full semantics.
+pub fn glob_rooted(root: &Path, pattern: &str) -> Result<RootedPaths, PatternError> {
+    glob_rooted_with(root, pattern, RootedOptions::new())
+}
+
+/// Return an iterator that recursively scans the directory tree rooted at
+/// `root` for paths matching `pattern`, using the specified options.
+///
+/// This may return an error if the pattern is invalid.
+///
+/// The scan never escapes `root`: with [`FollowLinks::Never`] no symbolic
+/// link is followed, and with [`FollowLinks::WithinRoot`] a link is followed
+/// only when its resolved target remains inside the root (checked per path
+/// component, not by string prefix). This is a static scope check on the
+/// filesystem tree at scan time; it does not defend against the filesystem
+/// being modified (e.g. links being retargeted) after the check.
+///
+/// Returned paths are relative to `root` and use the logical path the caller
+/// sees, so the same real directory reached through two different link
+/// aliases is reported once per alias. Directory loops are detected per
+/// ancestor chain rather than with a global visited set, so such aliases are
+/// both scanned, while a link pointing back at one of its own ancestors
+/// produces a single error item naming the path at which the walk was cut.
+///
+/// Results and errors are produced in a stable traversal order: directory
+/// entries are visited sorted by file name, depth first, and an error
+/// (including a cut loop, a broken link or an unreadable directory) is
+/// reported as an item and never aborts the rest of the scan.
+///
+/// # Errors during iteration
+///
+/// Each item is a [`GlobResult`]. Error items are distinguishable through
+/// the [`io::Error::kind`] of [`GlobError::error`]:
+///
+/// - a nonexistent (or otherwise unresolvable) `root` yields a single
+///   [`io::ErrorKind::NotFound`] error whose path is `root`;
+/// - a broken symbolic link (with [`FollowLinks::WithinRoot`]) yields
+///   [`io::ErrorKind::NotFound`] with the link's logical path;
+/// - an unreadable directory yields [`io::ErrorKind::PermissionDenied`]
+///   (or another OS error) with the directory's logical path;
+/// - a detected directory loop yields an [`io::ErrorKind::Other`] error
+///   whose message and [`GlobError::path`] name the logical path at which
+///   the walk was cut.
+pub fn glob_rooted_with(
+    root: &Path,
+    pattern: &str,
+    options: RootedOptions,
+) -> Result<RootedPaths, PatternError> {
+    let pattern = Pattern::new(pattern)?;
+
+    let (canonical_root, stack, init_error) = match fs::canonicalize(root) {
+        Ok(canonical_root) => {
+            let expand = RootedAction::Expand {
+                abs: root.to_path_buf(),
+                rel: PathBuf::new(),
+                depth: 0,
+                ancestors: vec![canonical_root.clone()],
+            };
+            (canonical_root, vec![expand], None)
+        }
+        Err(e) => (
+            PathBuf::new(),
+            Vec::new(),
+            Some(GlobError {
+                path: root.to_path_buf(),
+                error: e,
+            }),
+        ),
+    };
+
+    Ok(RootedPaths {
+        pattern,
+        options,
+        canonical_root,
+        stack,
+        init_error,
+    })
+}
+
+/// An iterator that yields [`Path`]s relative to the scan root, created by
+/// [`glob_rooted`] or [`glob_rooted_with`]. See those functions for details.
+#[derive(Debug)]
+pub struct RootedPaths {
+    pattern: Pattern,
+    options: RootedOptions,
+    canonical_root: PathBuf,
+    stack: Vec<RootedAction>,
+    init_error: Option<GlobError>,
+}
+
+#[derive(Debug)]
+enum RootedAction {
+    /// Read a directory's entries and schedule work for each of them.
+    Expand {
+        abs: PathBuf,
+        rel: PathBuf,
+        depth: usize,
+        ancestors: Vec<PathBuf>,
+    },
+    /// A path that cannot or must not be descended into; yielded if it
+    /// matches the pattern.
+    Leaf { rel: PathBuf },
+    /// A directory; yielded if it matches the pattern, then expanded.
+    Dir {
+        abs: PathBuf,
+        rel: PathBuf,
+        depth: usize,
+        ancestors: Vec<PathBuf>,
+    },
+    /// A pre-computed error item.
+    Fail(GlobError),
+}
+
+fn loop_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("filesystem loop detected; walk cut at `{}`", path.display()),
+    )
+}
+
+impl RootedPaths {
+    fn matches(&self, rel: &Path) -> bool {
+        self.pattern
+            .matches_path_with(rel, self.options.match_options)
+    }
+
+    /// Decide what to do with a single directory entry.
+    fn classify(
+        &self,
+        abs: PathBuf,
+        rel: PathBuf,
+        depth: usize,
+        ancestors: &[PathBuf],
+    ) -> RootedAction {
+        let metadata = match fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            Err(e) => return RootedAction::Fail(GlobError { path: rel, error: e }),
+        };
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            match self.options.follow_links {
+                FollowLinks::Never => RootedAction::Leaf { rel },
+                FollowLinks::WithinRoot => {
+                    let canonical = match fs::canonicalize(&abs) {
+                        Ok(c) => c,
+                        // Broken link (or unresolvable for another reason).
+                        Err(e) => return RootedAction::Fail(GlobError { path: rel, error: e }),
+                    };
+                    // Component-wise containment check: a sibling named
+                    // `root_extra` is not inside `root`.
+                    if !canonical.starts_with(&self.canonical_root) {
+                        return RootedAction::Leaf { rel };
+                    }
+                    if ancestors.iter().any(|a| *a == canonical) {
+                        return RootedAction::Fail(GlobError {
+                            error: loop_error(&rel),
+                            path: rel,
+                        });
+                    }
+                    let is_dir = fs::metadata(&abs).map(|m| m.is_dir()).unwrap_or(false);
+                    if is_dir {
+                        let mut chain = ancestors.to_vec();
+                        chain.push(canonical);
+                        RootedAction::Dir {
+                            abs,
+                            rel,
+                            depth,
+                            ancestors: chain,
+                        }
+                    } else {
+                        RootedAction::Leaf { rel }
+                    }
+                }
+            }
+        } else if file_type.is_dir() {
+            let canonical = fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+            if ancestors.iter().any(|a| *a == canonical) {
+                return RootedAction::Fail(GlobError {
+                    error: loop_error(&rel),
+                    path: rel,
+                });
+            }
+            let mut chain = ancestors.to_vec();
+            chain.push(canonical);
+            RootedAction::Dir {
+                abs,
+                rel,
+                depth,
+                ancestors: chain,
+            }
+        } else {
+            RootedAction::Leaf { rel }
+        }
+    }
+
+    /// Read the entries of a directory and push work for them onto the stack.
+    fn expand(&mut self, abs: PathBuf, rel: PathBuf, depth: usize, ancestors: Vec<PathBuf>) {
+        if self.options.max_depth.map_or(false, |max| depth >= max) {
+            return;
+        }
+        let read_dir = match fs::read_dir(&abs) {
+            Ok(rd) => rd,
+            Err(e) => {
+                self.stack
+                    .push(RootedAction::Fail(GlobError { path: rel, error: e }));
+                return;
+            }
+        };
+        let mut names = Vec::new();
+        let mut iter_error = None;
+        for entry in read_dir {
+            match entry {
+                Ok(entry) => names.push(entry.file_name()),
+                Err(e) => {
+                    if iter_error.is_none() {
+                        iter_error = Some(e);
+                    }
+                }
+            }
+        }
+        names.sort();
+        // The stack is LIFO: push entries in reverse so they are visited in
+        // sorted order. A listing error is pushed last so it is reported
+        // before the entries, without swallowing them.
+        if let Some(e) = iter_error {
+            self.stack.push(RootedAction::Fail(GlobError {
+                path: rel.clone(),
+                error: e,
+            }));
+        }
+        for name in names.into_iter().rev() {
+            let action = self.classify(abs.join(&name), rel.join(&name), depth + 1, &ancestors);
+            self.stack.push(action);
+        }
+    }
+}
+
+impl Iterator for RootedPaths {
+    type Item = GlobResult;
+
+    fn next(&mut self) -> Option<GlobResult> {
+        if let Some(e) = self.init_error.take() {
+            return Some(Err(e));
+        }
+        while let Some(action) = self.stack.pop() {
+            match action {
+                RootedAction::Fail(e) => return Some(Err(e)),
+                RootedAction::Leaf { rel } => {
+                    if self.matches(&rel) {
+                        return Some(Ok(rel));
+                    }
+                }
+                RootedAction::Dir {
+                    abs,
+                    rel,
+                    depth,
+                    ancestors,
+                } => {
+                    self.expand(abs, rel.clone(), depth, ancestors);
+                    if self.matches(&rel) {
+                        return Some(Ok(rel));
+                    }
+                }
+                RootedAction::Expand {
+                    abs,
+                    rel,
+                    depth,
+                    ancestors,
+                } => {
+                    self.expand(abs, rel, depth, ancestors);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// A pattern parsing error.
 #[derive(Debug)]
 #[allow(missing_copy_implementations)]
