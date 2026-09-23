@@ -83,6 +83,13 @@ use MatchResult::{EntirePatternDoesntMatch, Match, SubPatternDoesntMatch};
 use PatternToken::AnyExcept;
 use PatternToken::{AnyChar, AnyRecursiveSequence, AnySequence, AnyWithin, Char};
 
+mod rooted;
+
+pub use crate::rooted::{
+    glob_rooted, FollowLinks, RootedError, RootedErrorKind, RootedOptions, RootedPaths,
+    RootedResult,
+};
+
 /// An iterator that yields `Path`s from the filesystem that match a particular
 /// pattern.
 ///
