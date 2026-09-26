@@ -883,6 +883,400 @@ impl Pattern {
     }
 }
 
+/// The kind of a wildcard token within a `Pattern`.
+///
+/// This describes which sort of wildcard produced a particular
+/// `WildcardMatch` when a match is explained via `Pattern::explain_with`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WildcardKind {
+    /// A `*` token, matching any (possibly empty) sequence of characters.
+    Star,
+    /// A `**` token, matching the current directory and arbitrary
+    /// subdirectories.
+    RecursiveStar,
+    /// A `?` token, matching any single character.
+    Question,
+    /// A `[...]` token, matching any single character inside the brackets.
+    CharClass,
+    /// A `[!...]` token, matching any single character *not* inside the
+    /// brackets.
+    NegatedCharClass,
+}
+
+/// The slice of an input string that a single wildcard token of a `Pattern`
+/// consumed during a successful match, as reported by
+/// `Pattern::explain_with`.
+///
+/// The byte offsets always fall on UTF-8 character boundaries of the input,
+/// so they can be used to slice the input string directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WildcardMatch {
+    /// The index of the wildcard within the pattern's token sequence
+    /// (literal characters also count as tokens).
+    pub token_index: usize,
+    /// The kind of the wildcard token.
+    pub kind: WildcardKind,
+    /// The byte offset (inclusive) of the start of the consumed slice.
+    pub start: usize,
+    /// The byte offset (exclusive) of the end of the consumed slice.
+    pub end: usize,
+}
+
+impl WildcardMatch {
+    /// Return the slice of `input` that this wildcard consumed.
+    ///
+    /// `input` must be the same string that was passed to
+    /// `Pattern::explain`/`Pattern::explain_with`.
+    pub fn text<'a>(&self, input: &'a str) -> &'a str {
+        &input[self.start..self.end]
+    }
+}
+
+/// The result of explaining how a `Pattern` matches (or fails to match) an
+/// input string, as produced by `Pattern::explain` and
+/// `Pattern::explain_with`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchExplanation {
+    /// Whether the pattern matched the input. This always agrees with
+    /// `Pattern::matches_with` for the same input and options.
+    pub matched: bool,
+    /// The slices consumed by each wildcard token (`*`, `**`, `?` and
+    /// `[...]`/`[!...]`), in left-to-right order. This is empty when
+    /// `matched` is `false`.
+    ///
+    /// When several matches are possible, the reported explanation is the
+    /// one where each wildcard, considered from left to right, consumes as
+    /// few characters as possible.
+    pub wildcards: Vec<WildcardMatch>,
+    /// When `matched` is `false`, the earliest byte offset in the input at
+    /// which a mismatch was detected while searching for a match. The offset
+    /// always falls on a UTF-8 character boundary; it may be one past the
+    /// end of the input when the input was exhausted before the pattern was.
+    /// This is `None` when `matched` is `true`.
+    pub failure_offset: Option<usize>,
+}
+
+impl fmt::Display for MatchExplanation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.matched {
+            if self.wildcards.is_empty() {
+                write!(f, "matched (no wildcards)")
+            } else {
+                writeln!(f, "matched with {} wildcard(s):", self.wildcards.len())?;
+                for (i, w) in self.wildcards.iter().enumerate() {
+                    writeln!(
+                        f,
+                        "  #{} {:?} consumed bytes {}..{}",
+                        i, w.kind, w.start, w.end
+                    )?;
+                }
+                Ok(())
+            }
+        } else {
+            match self.failure_offset {
+                Some(offset) => write!(
+                    f,
+                    "no match (earliest failure determined at byte {})",
+                    offset
+                ),
+                None => write!(f, "no match"),
+            }
+        }
+    }
+}
+
+impl Pattern {
+    /// Explain how this pattern matches the given `str` using the default
+    /// match options (i.e. `MatchOptions::new()`).
+    ///
+    /// Unlike `Pattern::matches`, this reports *how* the pattern matched:
+    /// which slice of the input each wildcard (`*`, `**`, `?`, `[...]`)
+    /// consumed, or, when the pattern does not match, the earliest position
+    /// at which the mismatch was determined. No filesystem is accessed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use glob::Pattern;
+    ///
+    /// let pattern = Pattern::new("src/**/test_?.rs").unwrap();
+    /// let input = "src/模块一/test_q.rs";
+    /// let explanation = pattern.explain(input);
+    /// assert!(explanation.matched);
+    /// assert_eq!(explanation.wildcards[0].text(input), "模块一/");
+    /// assert_eq!(explanation.wildcards[1].text(input), "q");
+    /// ```
+    pub fn explain(&self, str: &str) -> MatchExplanation {
+        self.explain_with(str, MatchOptions::new())
+    }
+
+    /// Explain how this pattern matches the given `str` using the specified
+    /// match options.
+    ///
+    /// The matching semantics are identical to `Pattern::matches_with`: the
+    /// `matched` field of the result always agrees with it. See
+    /// `Pattern::explain` and `MatchExplanation` for details on what is
+    /// reported.
+    ///
+    /// The search is memoized, so explaining patterns with many consecutive
+    /// wildcards takes polynomial (not exponential) time in the length of
+    /// the input.
+    pub fn explain_with(&self, str: &str, options: MatchOptions) -> MatchExplanation {
+        let chars: Vec<char> = str.chars().collect();
+        let mut offsets: Vec<usize> = str.char_indices().map(|(i, _)| i).collect();
+        offsets.push(str.len());
+        let state_count = (self.tokens.len() + 1) * (chars.len() + 1) * 2;
+        let mut explainer = Explainer {
+            tokens: &self.tokens,
+            chars,
+            offsets,
+            options,
+            memo: vec![None; state_count],
+            failure_min: None,
+        };
+        if explainer.can(0, 0, true) {
+            let wildcards = explainer.walk();
+            MatchExplanation {
+                matched: true,
+                wildcards,
+                failure_offset: None,
+            }
+        } else {
+            MatchExplanation {
+                matched: false,
+                wildcards: Vec::new(),
+                failure_offset: explainer.failure_min,
+            }
+        }
+    }
+}
+
+/// A memoizing matcher used to implement `Pattern::explain_with`.
+///
+/// It mirrors the semantics of `Pattern::matches_from` exactly, but works
+/// on pre-collected character and byte-offset vectors so that consumed
+/// ranges can be reported, and it memoizes intermediate results so that
+/// patterns with many wildcards cannot cause exponential backtracking.
+struct Explainer<'a> {
+    tokens: &'a [PatternToken],
+    chars: Vec<char>,
+    /// `offsets[i]` is the byte offset of `chars[i]` in the input;
+    /// `offsets[chars.len()]` is the input length.
+    offsets: Vec<usize>,
+    options: MatchOptions,
+    memo: Vec<Option<bool>>,
+    /// The earliest byte offset at which a mismatch was detected.
+    failure_min: Option<usize>,
+}
+
+impl<'a> Explainer<'a> {
+    fn memo_index(&self, ti: usize, ci: usize, follows_separator: bool) -> usize {
+        ((ti * (self.chars.len() + 1)) + ci) * 2 + follows_separator as usize
+    }
+
+    fn record_failure(&mut self, ci: usize) {
+        let offset = self.offsets[ci];
+        self.failure_min = Some(match self.failure_min {
+            Some(min) => cmp::min(min, offset),
+            None => offset,
+        });
+    }
+
+    /// Compute the attempts a star token at input position `ci` may make,
+    /// in increasing order of consumption.
+    ///
+    /// Returns the list of `(consumed_chars, follows_separator)` pairs to
+    /// try, plus the input position at which consumption was forced to stop
+    /// early (a `require_literal_leading_dot` or `require_literal_separator`
+    /// violation), if any.
+    fn star_attempts(
+        &self,
+        ci: usize,
+        follows_separator: bool,
+        recursive: bool,
+    ) -> (Vec<(usize, bool)>, Option<usize>) {
+        let n = self.chars.len();
+        let mut attempts = Vec::new();
+        let mut failure = None;
+        let mut cur_follows_separator = follows_separator;
+        let mut k = 0;
+        loop {
+            // `**` only attempts a sub-match right after a separator, except
+            // that consuming the rest of the input always counts (this
+            // mirrors `matches_from` falling out of its consumption loop).
+            if k == 0 || !recursive || cur_follows_separator || ci + k == n {
+                attempts.push((k, cur_follows_separator));
+            }
+            if ci + k == n {
+                break;
+            }
+            let c = self.chars[ci + k];
+            if cur_follows_separator && self.options.require_literal_leading_dot && c == '.' {
+                failure = Some(ci + k);
+                break;
+            }
+            cur_follows_separator = path::is_separator(c);
+            k += 1;
+            if !recursive && self.options.require_literal_separator && cur_follows_separator {
+                failure = Some(ci + k - 1);
+                break;
+            }
+        }
+        (attempts, failure)
+    }
+
+    /// Return whether `tokens[ti..]` can match `chars[ci..]`, with
+    /// `follows_separator` indicating whether `chars[ci]` directly follows
+    /// a path separator. Memoized; equivalent to `Pattern::matches_from`.
+    fn can(&mut self, ti0: usize, ci0: usize, fs0: bool) -> bool {
+        let tokens = self.tokens;
+        let n = self.chars.len();
+        let mut ti = ti0;
+        let mut ci = ci0;
+        let mut follows_separator = fs0;
+        let mut visited = Vec::new();
+        let result = loop {
+            let idx = self.memo_index(ti, ci, follows_separator);
+            if let Some(cached) = self.memo[idx] {
+                break cached;
+            }
+            visited.push(idx);
+            if ti == tokens.len() {
+                if ci == n {
+                    break true;
+                }
+                self.record_failure(ci);
+                break false;
+            }
+            match tokens[ti] {
+                AnySequence | AnyRecursiveSequence => {
+                    let recursive = tokens[ti] == AnyRecursiveSequence;
+                    let (attempts, failure) = self.star_attempts(ci, follows_separator, recursive);
+                    if let Some(failure) = failure {
+                        self.record_failure(failure);
+                    }
+                    let mut matched = false;
+                    for (k, next_follows_separator) in attempts {
+                        if self.can(ti + 1, ci + k, next_follows_separator) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    break matched;
+                }
+                _ => {
+                    if ci == n {
+                        self.record_failure(n);
+                        break false;
+                    }
+                    let c = self.chars[ci];
+                    let is_sep = path::is_separator(c);
+                    if !token_matches(&tokens[ti], c, is_sep, follows_separator, self.options) {
+                        self.record_failure(ci);
+                        break false;
+                    }
+                    ti += 1;
+                    ci += 1;
+                    follows_separator = is_sep;
+                }
+            }
+        };
+        for idx in visited {
+            self.memo[idx] = Some(result);
+        }
+        result
+    }
+
+    /// Reconstruct the left-to-right minimal-consumption explanation of a
+    /// successful match. Must only be called after `can(0, 0, true)`
+    /// returned `true`.
+    fn walk(&mut self) -> Vec<WildcardMatch> {
+        let tokens = self.tokens;
+        let mut wildcards = Vec::new();
+        let mut ti = 0;
+        let mut ci = 0;
+        let mut follows_separator = true;
+        while ti < tokens.len() {
+            match tokens[ti] {
+                AnySequence | AnyRecursiveSequence => {
+                    let recursive = tokens[ti] == AnyRecursiveSequence;
+                    let (attempts, _) = self.star_attempts(ci, follows_separator, recursive);
+                    let mut chosen = None;
+                    for (k, next_follows_separator) in attempts {
+                        if self.can(ti + 1, ci + k, next_follows_separator) {
+                            chosen = Some((k, next_follows_separator));
+                            break;
+                        }
+                    }
+                    let (k, next_follows_separator) = chosen.expect("explain: walk lost a match");
+                    wildcards.push(WildcardMatch {
+                        token_index: ti,
+                        kind: if recursive {
+                            WildcardKind::RecursiveStar
+                        } else {
+                            WildcardKind::Star
+                        },
+                        start: self.offsets[ci],
+                        end: self.offsets[ci + k],
+                    });
+                    ci += k;
+                    follows_separator = next_follows_separator;
+                    ti += 1;
+                }
+                Char(_) => {
+                    follows_separator = path::is_separator(self.chars[ci]);
+                    ci += 1;
+                    ti += 1;
+                }
+                _ => {
+                    let kind = match tokens[ti] {
+                        AnyChar => WildcardKind::Question,
+                        AnyWithin(..) => WildcardKind::CharClass,
+                        AnyExcept(..) => WildcardKind::NegatedCharClass,
+                        _ => unreachable!(),
+                    };
+                    wildcards.push(WildcardMatch {
+                        token_index: ti,
+                        kind,
+                        start: self.offsets[ci],
+                        end: self.offsets[ci + 1],
+                    });
+                    follows_separator = path::is_separator(self.chars[ci]);
+                    ci += 1;
+                    ti += 1;
+                }
+            }
+        }
+        debug_assert_eq!(ci, self.chars.len());
+        wildcards
+    }
+}
+
+/// A helper to determine whether a single non-star token matches a character.
+///
+/// This mirrors the corresponding logic in `Pattern::matches_from`.
+fn token_matches(
+    token: &PatternToken,
+    c: char,
+    is_sep: bool,
+    follows_separator: bool,
+    options: MatchOptions,
+) -> bool {
+    match *token {
+        AnyChar | AnyWithin(..) | AnyExcept(..)
+            if (options.require_literal_separator && is_sep)
+                || (follows_separator && options.require_literal_leading_dot && c == '.') =>
+        {
+            false
+        }
+        AnyChar => true,
+        AnyWithin(ref specifiers) => in_char_specifiers(specifiers, c, options),
+        AnyExcept(ref specifiers) => !in_char_specifiers(specifiers, c, options),
+        Char(c2) => chars_eq(c, c2, options.case_sensitive),
+        AnySequence | AnyRecursiveSequence => unreachable!(),
+    }
+}
+
 // Fills `todo` with paths under `path` to be matched by `patterns[idx]`,
 // special-casing patterns to match `.` and `..`, and avoiding `readdir()`
 // calls when there are no metacharacters in the pattern.
@@ -1516,5 +1910,183 @@ mod test {
     fn test_path_join() {
         let pattern = Path::new("one").join(Path::new("**/*.rs"));
         assert!(Pattern::new(pattern.to_str().unwrap()).is_ok());
+    }
+
+    /// Naively enumerate every way `pattern` can match `s`, returning the
+    /// consumption (in chars) of each wildcard token for each match.
+    ///
+    /// This is an exponential-time oracle used to cross-check the
+    /// left-to-right minimal-consumption explanations produced by
+    /// `Pattern::explain_with` on small inputs.
+    fn brute_force_consumptions(
+        pattern: &Pattern,
+        s: &str,
+        options: MatchOptions,
+    ) -> Vec<Vec<usize>> {
+        use super::PatternToken::*;
+        #[allow(clippy::too_many_arguments)]
+        fn rec(
+            tokens: &[super::PatternToken],
+            ti: usize,
+            chars: &[char],
+            ci: usize,
+            follows_separator: bool,
+            options: MatchOptions,
+            acc: &mut Vec<usize>,
+            out: &mut Vec<Vec<usize>>,
+        ) {
+            if ti == tokens.len() {
+                if ci == chars.len() {
+                    out.push(acc.clone());
+                }
+                return;
+            }
+            match tokens[ti] {
+                AnySequence | AnyRecursiveSequence => {
+                    let recursive = tokens[ti] == AnyRecursiveSequence;
+                    let n = chars.len();
+                    let mut cur_follows_separator = follows_separator;
+                    let mut k = 0;
+                    loop {
+                        if k == 0 || !recursive || cur_follows_separator || ci + k == n {
+                            acc.push(k);
+                            rec(
+                                tokens,
+                                ti + 1,
+                                chars,
+                                ci + k,
+                                cur_follows_separator,
+                                options,
+                                acc,
+                                out,
+                            );
+                            acc.pop();
+                        }
+                        if ci + k == n {
+                            break;
+                        }
+                        let c = chars[ci + k];
+                        if cur_follows_separator && options.require_literal_leading_dot && c == '.'
+                        {
+                            break;
+                        }
+                        cur_follows_separator = std::path::is_separator(c);
+                        k += 1;
+                        if !recursive && options.require_literal_separator && cur_follows_separator
+                        {
+                            break;
+                        }
+                    }
+                }
+                Char(c2) => {
+                    if ci < chars.len() {
+                        let c = chars[ci];
+                        if super::chars_eq(c, c2, options.case_sensitive) {
+                            rec(
+                                tokens,
+                                ti + 1,
+                                chars,
+                                ci + 1,
+                                std::path::is_separator(c),
+                                options,
+                                acc,
+                                out,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    if ci < chars.len() {
+                        let c = chars[ci];
+                        let is_sep = std::path::is_separator(c);
+                        if super::token_matches(&tokens[ti], c, is_sep, follows_separator, options)
+                        {
+                            acc.push(1);
+                            rec(tokens, ti + 1, chars, ci + 1, is_sep, options, acc, out);
+                            acc.pop();
+                        }
+                    }
+                }
+            }
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut acc = Vec::new();
+        rec(
+            &pattern.tokens,
+            0,
+            &chars,
+            0,
+            true,
+            options,
+            &mut acc,
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn test_explain_agrees_with_brute_force() {
+        let patterns = [
+            "", "a", "ab", "*", "**", "?", "[ab]", "[!ab]", "a*", "*a", "a*a", "*a*", "a*a*a",
+            "*.*", "**/a", "a/**", "a/**/b", "**/*", "*/?", "a*b*c", "[ab]*c", "a?c", ".*",
+            "**/.*",
+        ];
+        let inputs = [
+            "", "a", "b", "aa", "ab", "ba", "aaa", "abab", "a.b", "a/b", "a/b/c", ".a", "a.",
+            "abc", "xaybz",
+        ];
+        for case_sensitive in [true, false] {
+            for require_literal_separator in [true, false] {
+                for require_literal_leading_dot in [true, false] {
+                    let options = MatchOptions {
+                        case_sensitive,
+                        require_literal_separator,
+                        require_literal_leading_dot,
+                    };
+                    for &pat in patterns.iter() {
+                        let pattern = Pattern::new(pat).unwrap();
+                        for &input in inputs.iter() {
+                            let explanation = pattern.explain_with(input, options);
+                            assert_eq!(
+                                explanation.matched,
+                                pattern.matches_with(input, options),
+                                "match disagreement for {:?} vs {:?} with {:?}",
+                                pat,
+                                input,
+                                options
+                            );
+                            let mut all = brute_force_consumptions(&pattern, input, options);
+                            all.sort();
+                            all.dedup();
+                            if explanation.matched {
+                                let got: Vec<usize> = explanation
+                                    .wildcards
+                                    .iter()
+                                    .map(|w| input[w.start..w.end].chars().count())
+                                    .collect();
+                                assert_eq!(
+                                    Some(&got),
+                                    all.first(),
+                                    "explanation is not left-to-right minimal for {:?} vs {:?} with {:?}",
+                                    pat,
+                                    input,
+                                    options
+                                );
+                            } else {
+                                assert!(
+                                    all.is_empty(),
+                                    "brute force found a match for {:?} vs {:?} with {:?}",
+                                    pat,
+                                    input,
+                                    options
+                                );
+                                assert!(explanation.failure_offset.is_some());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

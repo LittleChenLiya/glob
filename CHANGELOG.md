@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `Pattern::explain` and `Pattern::explain_with`, returning a
+  `MatchExplanation` that reports which byte range of the input each
+  wildcard (`*`, `**`, `?`, `[...]`) consumed, or the earliest
+  position at which a mismatch was determined
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))
