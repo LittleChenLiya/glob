@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `Pattern::explain` and `Pattern::explain_with`, which report the byte
+  range consumed by every wildcard part on a match (choosing the
+  left-to-right shortest consumption) and the earliest failure position on a
+  mismatch, without filesystem access
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))

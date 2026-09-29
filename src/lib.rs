@@ -257,6 +257,7 @@ pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternE
             tokens: Vec::new(),
             is_recursive: false,
             has_metachars: false,
+            wildcards: Vec::new(),
         });
     }
 
@@ -560,6 +561,18 @@ pub struct Pattern {
     /// A bool value that indicates whether the pattern contains any metacharacters.
     /// We use this information for some fast path optimizations.
     has_metachars: bool,
+    /// Metadata for every wildcard token (`?`, `*`, `**`, `[...]`) in `tokens`,
+    /// in token order. Used by `Pattern::explain_with`.
+    wildcards: Vec<CompiledWildcard>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct CompiledWildcard {
+    /// Index of the corresponding token in `Pattern::tokens`.
+    token: usize,
+    kind: WildcardKind,
+    /// Byte range of this wildcard in the original pattern.
+    pattern_range: (usize, usize),
 }
 
 /// Show the original glob pattern.
@@ -587,6 +600,95 @@ enum PatternToken {
     AnyExcept(Vec<CharSpecifier>),
 }
 
+/// The kind of a wildcard part of a [`Pattern`], as reported by
+/// [`Pattern::explain_with`].
+///
+/// A "wildcard part" is any token in the pattern that can match more than a
+/// single fixed character: `?`, `*`, the path-only `**`, and `[...]` /
+/// `[!... ]` character classes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WildcardKind {
+    /// The `?` wildcard: any single character.
+    Question,
+    /// The `*` wildcard: any (possibly empty) sequence of characters.
+    AnySequence,
+    /// The `**` path wildcard: zero or more whole path components.
+    RecursiveSequence,
+    /// A `[...]` character class. `negated` is `true` for `[!...]`.
+    CharacterClass {
+        /// Whether this class was negated with a leading `!`.
+        negated: bool,
+    },
+}
+
+/// Describes what one wildcard part of a [`Pattern`] matched, as reported by
+/// [`ExplainResult::Match`].
+///
+/// Ranges are byte offsets into, respectively, the original pattern and the
+/// path that was explained. Both ranges always fall on UTF-8 character
+/// boundaries, so slicing the corresponding strings is safe even when they
+/// contain multi-byte characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WildcardCapture<'a> {
+    /// What kind of wildcard this capture describes.
+    pub kind: WildcardKind,
+    /// Byte range of the wildcard in the original pattern.
+    pub pattern_range: std::ops::Range<usize>,
+    /// Byte range consumed by the wildcard in the explained path.
+    pub range: std::ops::Range<usize>,
+    /// The substring of the explained path consumed by the wildcard.
+    pub text: &'a str,
+}
+
+/// The result of [`Pattern::explain_with`].
+///
+/// When the path matches, this reports the substring consumed by every
+/// wildcard part of the pattern. When it does not match, this reports the
+/// earliest position at which matching was determined to fail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExplainResult<'a> {
+    /// The path matched the pattern.
+    Match {
+        /// What each wildcard part of the pattern matched, ordered from left
+        /// to right in the pattern.
+        captures: Vec<WildcardCapture<'a>>,
+    },
+    /// The path did not match the pattern.
+    NoMatch {
+        /// Byte offset into the explained path of the earliest unavoidable
+        /// mismatch. This is the position of the first contradictory
+        /// character, the end of the path when more input was needed, or the
+        /// first leftover character when the pattern ended early. It always
+        /// lies on a UTF-8 character boundary and may equal the path length.
+        failed_at_byte: usize,
+    },
+}
+
+impl<'a> ExplainResult<'a> {
+    /// Returns `true` if the explained path matched the pattern.
+    pub fn is_match(&self) -> bool {
+        matches!(*self, ExplainResult::Match { .. })
+    }
+
+    /// Returns what each wildcard part matched, or an empty slice if the path
+    /// did not match.
+    pub fn captures(&self) -> &[WildcardCapture<'a>] {
+        match *self {
+            ExplainResult::Match { ref captures } => captures,
+            ExplainResult::NoMatch { .. } => &[],
+        }
+    }
+
+    /// Returns the byte offset of the earliest unavoidable mismatch, or
+    /// `None` when the path matched.
+    pub fn failed_at_byte(&self) -> Option<usize> {
+        match *self {
+            ExplainResult::Match { .. } => None,
+            ExplainResult::NoMatch { failed_at_byte } => Some(failed_at_byte),
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum CharSpecifier {
     SingleChar(char),
@@ -612,14 +714,28 @@ impl Pattern {
     pub fn new(pattern: &str) -> Result<Self, PatternError> {
         let chars = pattern.chars().collect::<Vec<_>>();
         let mut tokens = Vec::new();
+        let mut wildcards = Vec::new();
         let mut is_recursive = false;
         let mut has_metachars = false;
         let mut i = 0;
+
+        // Byte offset at which every character starts, plus one entry for the
+        // end of the pattern. Used when recording wildcard ranges.
+        let mut byte_at = vec![0usize; chars.len() + 1];
+        for (idx, c) in chars.iter().enumerate() {
+            byte_at[idx + 1] = byte_at[idx] + c.len_utf8();
+        }
+        let byte_at = byte_at;
 
         while i < chars.len() {
             match chars[i] {
                 '?' => {
                     has_metachars = true;
+                    wildcards.push(CompiledWildcard {
+                        token: tokens.len(),
+                        kind: WildcardKind::Question,
+                        pattern_range: (byte_at[i], byte_at[i + 1]),
+                    });
                     tokens.push(AnyChar);
                     i += 1;
                 }
@@ -679,11 +795,26 @@ impl Pattern {
                                     && tokens[tokens_len - 1] == AnyRecursiveSequence)
                                 {
                                     is_recursive = true;
+                                    // The recursive token also consumes the
+                                    // following separator semantically, but
+                                    // its range in the pattern is just `**`.
+                                    wildcards.push(CompiledWildcard {
+                                        token: tokens_len,
+                                        kind: WildcardKind::RecursiveSequence,
+                                        pattern_range: (byte_at[old], byte_at[old + 2]),
+                                    });
                                     tokens.push(AnyRecursiveSequence);
                                 }
                             }
                         }
-                        Ordering::Less => tokens.push(AnySequence),
+                        Ordering::Less => {
+                            wildcards.push(CompiledWildcard {
+                                token: tokens.len(),
+                                kind: WildcardKind::AnySequence,
+                                pattern_range: (byte_at[old], byte_at[old + 1]),
+                            });
+                            tokens.push(AnySequence);
+                        }
                     }
                 }
                 '[' => {
@@ -695,8 +826,14 @@ impl Pattern {
                             Some(j) => {
                                 let chars = &chars[i + 2..i + 3 + j];
                                 let cs = parse_char_specifiers(chars);
-                                tokens.push(AnyExcept(cs));
+                                let start = i;
                                 i += j + 4;
+                                wildcards.push(CompiledWildcard {
+                                    token: tokens.len(),
+                                    kind: WildcardKind::CharacterClass { negated: true },
+                                    pattern_range: (byte_at[start], byte_at[i]),
+                                });
+                                tokens.push(AnyExcept(cs));
                                 continue;
                             }
                         }
@@ -705,8 +842,14 @@ impl Pattern {
                             None => (),
                             Some(j) => {
                                 let cs = parse_char_specifiers(&chars[i + 1..i + 2 + j]);
-                                tokens.push(AnyWithin(cs));
+                                let start = i;
                                 i += j + 3;
+                                wildcards.push(CompiledWildcard {
+                                    token: tokens.len(),
+                                    kind: WildcardKind::CharacterClass { negated: false },
+                                    pattern_range: (byte_at[start], byte_at[i]),
+                                });
+                                tokens.push(AnyWithin(cs));
                                 continue;
                             }
                         }
@@ -730,6 +873,7 @@ impl Pattern {
             original: pattern.to_string(),
             is_recursive,
             has_metachars,
+            wildcards,
         })
     }
 
@@ -795,6 +939,199 @@ impl Pattern {
     /// Access the original glob pattern.
     pub fn as_str(&self) -> &str {
         &self.original
+    }
+
+    /// Explain how the given `str` matches (or fails to match) this pattern
+    /// using the default match options (i.e. `MatchOptions::new()`).
+    ///
+    /// See [`Pattern::explain_with`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glob::Pattern;
+    ///
+    /// let pattern = Pattern::new("src/**/test_?.rs").unwrap();
+    /// let result = pattern.explain("src/项目/子目录/test_中.rs");
+    /// for capture in result.captures() {
+    ///     println!(
+    ///         "{:?} matched {:?} ({}..{})",
+    ///         capture.kind, capture.text, capture.range.start, capture.range.end
+    ///     );
+    /// }
+    /// ```
+    pub fn explain<'a>(&self, str: &'a str) -> ExplainResult<'a> {
+        self.explain_with(str, MatchOptions::new())
+    }
+
+    /// Explain how the given `str` matches (or fails to match) this pattern
+    /// using the specified match options.
+    ///
+    /// The matching semantics are exactly those of
+    /// [`Pattern::matches_with`]: [`ExplainResult::is_match`] returns the same
+    /// answer as that method for the same inputs, including the behaviour of
+    /// `require_literal_separator`, `require_literal_leading_dot` and
+    /// `case_sensitive`. No filesystem access is performed.
+    ///
+    /// On a match, the returned captures describe the substring of `str`
+    /// consumed by every wildcard part (`?`, `*`, `**` and `[...]`) of the
+    /// pattern, ordered from left to right. When a pattern has several ways
+    /// to match, the explanation is the one that makes the captured lengths,
+    /// considered from left to right, lexicographically smallest: each
+    /// wildcard consumes as little as possible before later wildcards are
+    /// asked to grow. Every returned range is a byte range on a UTF-8
+    /// character boundary.
+    ///
+    /// On a mismatch, `failed_at_byte` is the byte offset of the earliest
+    /// contradiction reached while trying the shortest matches first: the
+    /// first character that cannot agree with the pattern, the end of the
+    /// input when the pattern needs another character, or the first leftover
+    /// character when the pattern is exhausted first.
+    ///
+    /// This method uses a separate, memoized matcher and does not change the
+    /// implementation (or performance) of [`Pattern::matches_with`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glob::{MatchOptions, Pattern};
+    ///
+    /// let pattern = Pattern::new("a*b*c").unwrap();
+    /// let result = pattern.explain("aXXbYYc");
+    /// assert!(result.is_match());
+    /// assert_eq!(result.captures()[0].text, "XX");
+    /// assert_eq!(result.captures()[1].text, "YY");
+    ///
+    /// let tail = Pattern::new("abc/def/ghi").unwrap();
+    /// let result = tail.explain("abc/def/");
+    /// assert!(!result.is_match());
+    /// // the pattern needs more characters, but the path ends here
+    /// assert_eq!(result.failed_at_byte(), Some(8));
+    /// ```
+    pub fn explain_with<'a>(&self, str: &'a str, options: MatchOptions) -> ExplainResult<'a> {
+        let result = self.explain_impl(str, options);
+        debug_assert_eq!(
+            self.matches_with(str, options),
+            match result {
+                ExplainResult::Match { .. } => true,
+                ExplainResult::NoMatch { .. } => false,
+            }
+        );
+        result
+    }
+
+    fn explain_impl<'a>(&self, str: &'a str, options: MatchOptions) -> ExplainResult<'a> {
+        let chars = str.chars().collect::<Vec<_>>();
+        // Byte offset at which every character starts, plus one entry for the
+        // end of the string. Built once so every reported range is a byte
+        // range on a UTF-8 boundary.
+        let mut char_to_byte = Vec::with_capacity(chars.len() + 1);
+        let mut byte = 0;
+        char_to_byte.push(0);
+        for c in &chars {
+            byte += c.len_utf8();
+            char_to_byte.push(byte);
+        }
+
+        let mut engine = ExplainEngine {
+            tokens: &self.tokens,
+            chars: &chars,
+            options,
+            memo: vec![None; 2 * (self.tokens.len() + 1) * (chars.len() + 1)],
+        };
+
+        if !engine.can_finish(true, 0, 0) {
+            let failed_at_char = engine.earliest_failure(true, 0, 0);
+            return ExplainResult::NoMatch {
+                failed_at_byte: char_to_byte[failed_at_char],
+            };
+        }
+
+        // Reconstruct the lexicographically smallest explanation: each
+        // sequence wildcard grows only when no match is possible at its
+        // current length, so wildcards are minimal from left to right.
+        let mut captures = Vec::with_capacity(self.wildcards.len());
+        let mut wildcard_idx = 0;
+        let mut token_idx = 0;
+        let mut char_pos = 0;
+        let mut follows_separator = true;
+
+        while token_idx < self.tokens.len() {
+            match self.tokens[token_idx] {
+                AnySequence | AnyRecursiveSequence => {
+                    let start = char_pos;
+                    let mut end = start;
+                    let mut end_follows_separator = true;
+                    for_each_sequence_stop(
+                        &self.tokens[token_idx],
+                        &chars,
+                        options,
+                        follows_separator,
+                        start,
+                        |next, next_follows_separator| {
+                            let can =
+                                engine.can_finish(next_follows_separator, token_idx + 1, next);
+                            if can {
+                                end = next;
+                                end_follows_separator = next_follows_separator;
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                    );
+                    let wildcard = &self.wildcards[wildcard_idx];
+                    debug_assert_eq!(wildcard.token, token_idx);
+                    captures.push(self.capture(wildcard, str, &char_to_byte, start, end));
+                    wildcard_idx += 1;
+                    token_idx += 1;
+                    char_pos = end;
+                    follows_separator = end_follows_separator;
+                }
+                _ => {
+                    if matches!(
+                        self.tokens[token_idx],
+                        AnyChar | AnyWithin(..) | AnyExcept(..)
+                    ) {
+                        let wildcard = &self.wildcards[wildcard_idx];
+                        debug_assert_eq!(wildcard.token, token_idx);
+                        captures.push(self.capture(
+                            wildcard,
+                            str,
+                            &char_to_byte,
+                            char_pos,
+                            char_pos + 1,
+                        ));
+                        wildcard_idx += 1;
+                    }
+                    follows_separator = path::is_separator(chars[char_pos]);
+                    token_idx += 1;
+                    char_pos += 1;
+                }
+            }
+        }
+
+        debug_assert_eq!(char_pos, chars.len());
+        debug_assert_eq!(wildcard_idx, self.wildcards.len());
+        ExplainResult::Match { captures }
+    }
+
+    fn capture<'s>(
+        &self,
+        wildcard: &CompiledWildcard,
+        str: &'s str,
+        char_to_byte: &[usize],
+        start_char: usize,
+        end_char: usize,
+    ) -> WildcardCapture<'s> {
+        let byte_start = char_to_byte[start_char];
+        let byte_end = char_to_byte[end_char];
+        WildcardCapture {
+            kind: wildcard.kind,
+            pattern_range: wildcard.pattern_range.0..wildcard.pattern_range.1,
+            range: byte_start..byte_end,
+            text: &str[byte_start..byte_end],
+        }
     }
 
     fn matches_from(
@@ -881,6 +1218,226 @@ impl Pattern {
             SubPatternDoesntMatch
         }
     }
+}
+
+/// Memoized backtracking matcher used by `Pattern::explain_with`.
+///
+/// It implements exactly the same matching semantics as `matches_from`, but
+/// every `(token, character)` state is evaluated at most once, so patterns
+/// with many repeated stars are handled in polynomial (not exponential)
+/// time.
+struct ExplainEngine<'a> {
+    tokens: &'a [PatternToken],
+    chars: &'a [char],
+    options: MatchOptions,
+    /// Cached outcomes, keyed by `(follows_separator, token, character)`.
+    memo: Vec<Option<bool>>,
+}
+
+impl<'a> ExplainEngine<'a> {
+    fn memo_index(&self, follows_separator: bool, token_idx: usize, char_pos: usize) -> usize {
+        let width = self.chars.len() + 1;
+        (follows_separator as usize) * (self.tokens.len() + 1) * width
+            + token_idx * width
+            + char_pos
+    }
+
+    /// Whether the suffix starting at `(token_idx, char_pos)` can match the
+    /// suffix of the path. This is the memoized equivalent of
+    /// `Pattern::matches_from`.
+    fn can_finish(&mut self, follows_separator: bool, token_idx: usize, char_pos: usize) -> bool {
+        let memo_index = self.memo_index(follows_separator, token_idx, char_pos);
+        if let Some(result) = self.memo[memo_index] {
+            return result;
+        }
+
+        let result = if token_idx == self.tokens.len() {
+            char_pos == self.chars.len()
+        } else {
+            let token = self.tokens[token_idx].clone();
+            match token {
+                AnySequence | AnyRecursiveSequence => {
+                    let mut outcome = false;
+                    for_each_sequence_stop(
+                        &token,
+                        self.chars,
+                        self.options,
+                        follows_separator,
+                        char_pos,
+                        |next, next_follows_separator| {
+                            if self.can_finish(next_follows_separator, token_idx + 1, next) {
+                                outcome = true;
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                    );
+                    outcome
+                }
+                _ => self.match_single_token(&token, follows_separator, token_idx, char_pos),
+            }
+        };
+
+        self.memo[memo_index] = Some(result);
+        result
+    }
+
+    /// Match a non-sequence token: exactly one character is consumed.
+    fn match_single_token(
+        &mut self,
+        token: &PatternToken,
+        follows_separator: bool,
+        token_idx: usize,
+        char_pos: usize,
+    ) -> bool {
+        let c = match self.chars.get(char_pos) {
+            Some(c) => *c,
+            None => return false,
+        };
+
+        let is_sep = path::is_separator(c);
+        let matched = match *token {
+            AnyChar | AnyWithin(..) | AnyExcept(..)
+                if (self.options.require_literal_separator && is_sep)
+                    || (follows_separator
+                        && self.options.require_literal_leading_dot
+                        && c == '.') =>
+            {
+                false
+            }
+            AnyChar => true,
+            AnyWithin(ref specifiers) => in_char_specifiers(specifiers, c, self.options),
+            AnyExcept(ref specifiers) => !in_char_specifiers(specifiers, c, self.options),
+            Char(expected) => chars_eq(c, expected, self.options.case_sensitive),
+            AnySequence | AnyRecursiveSequence => unreachable!(),
+        };
+        matched && self.can_finish(is_sep, token_idx + 1, char_pos + 1)
+    }
+
+    /// Character position of the first contradiction reached while trying
+    /// the shortest matches first (the first leaf visited by the recursive
+    /// `matches_from` search).
+    fn earliest_failure(
+        &self,
+        follows_separator: bool,
+        token_idx: usize,
+        char_pos: usize,
+    ) -> usize {
+        if token_idx == self.tokens.len() {
+            // Path characters remain, or the path ended exactly here.
+            return char_pos;
+        }
+
+        let token = &self.tokens[token_idx];
+        match *token {
+            AnySequence | AnyRecursiveSequence => {
+                // First attempt is always the empty match; `follows_separator`
+                // is unchanged by an empty consumption.
+                self.earliest_failure(follows_separator, token_idx + 1, char_pos)
+            }
+            _ => {
+                if char_pos == self.chars.len() {
+                    // The pattern needs another character.
+                    char_pos
+                } else {
+                    let single_ok =
+                        self.match_single_token_readonly(token, follows_separator, char_pos);
+                    if single_ok {
+                        self.earliest_failure(
+                            path::is_separator(self.chars[char_pos]),
+                            token_idx + 1,
+                            char_pos + 1,
+                        )
+                    } else {
+                        // This is the first contradictory character.
+                        char_pos
+                    }
+                }
+            }
+        }
+    }
+
+    fn match_single_token_readonly(
+        &self,
+        token: &PatternToken,
+        follows_separator: bool,
+        char_pos: usize,
+    ) -> bool {
+        let c = match self.chars.get(char_pos) {
+            Some(c) => *c,
+            None => return false,
+        };
+        let is_sep = path::is_separator(c);
+        match *token {
+            AnyChar | AnyWithin(..) | AnyExcept(..)
+                if (self.options.require_literal_separator && is_sep)
+                    || (follows_separator
+                        && self.options.require_literal_leading_dot
+                        && c == '.') =>
+            {
+                false
+            }
+            AnyChar => true,
+            AnyWithin(ref specifiers) => in_char_specifiers(specifiers, c, self.options),
+            AnyExcept(ref specifiers) => !in_char_specifiers(specifiers, c, self.options),
+            Char(expected) => chars_eq(c, expected, self.options.case_sensitive),
+            AnySequence | AnyRecursiveSequence => unreachable!(),
+        }
+    }
+}
+
+/// Visit the character positions at which a sequence token may stop, in the
+/// order tried by `matches_from`: the empty match first, then every legal
+/// non-empty consumption of increasing length. Returning `true` from the
+/// callback stops the enumeration.
+fn for_each_sequence_stop(
+    token: &PatternToken,
+    chars: &[char],
+    options: MatchOptions,
+    entry_follows_separator: bool,
+    start: usize,
+    mut visit: impl FnMut(usize, bool) -> bool,
+) {
+    // Empty match.
+    if visit(start, entry_follows_separator) {
+        return;
+    }
+
+    let recursive = matches!(*token, AnyRecursiveSequence);
+    let mut follows_separator = entry_follows_separator;
+    let mut pos = start;
+    while pos < chars.len() {
+        let c = chars[pos];
+        pos += 1;
+
+        let is_sep = path::is_separator(c);
+        if options.require_literal_leading_dot && follows_separator && c == '.' {
+            return;
+        }
+
+        if recursive {
+            if !is_sep {
+                // A recursive wildcard may only hand over at a component
+                // boundary (the position right after a separator), or at the
+                // end of the path where the terminal match applies.
+                follows_separator = false;
+                continue;
+            }
+        } else if options.require_literal_separator && is_sep {
+            return;
+        }
+
+        follows_separator = is_sep;
+        if visit(pos, follows_separator) {
+            return;
+        }
+    }
+
+    // Consuming the rest of the path leaves the token loop in `matches_from`;
+    // the end-of-input check still applies. The callbacks reject it unless
+    // the sequence is the final token, so it never causes spurious matches.
+    visit(pos, follows_separator);
 }
 
 // Fills `todo` with paths under `path` to be matched by `patterns[idx]`,
