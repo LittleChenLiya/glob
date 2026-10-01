@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `Pattern::prefix_matcher` compiling a reusable `PrefixMatcher` that
+  decides whether a directory prefix can still lead to a match, yielding a
+  shortest completion over a caller-supplied alphabet when one exists
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))

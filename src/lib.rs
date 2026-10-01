@@ -1108,6 +1108,304 @@ impl MatchOptions {
     }
 }
 
+/// The result of checking a directory prefix against a [`PrefixMatcher`].
+///
+/// The question answered for directory pruning is: "below this prefix, is
+/// there still at least one *non-empty* descendant path that can match the
+/// pattern?" Note that the prefix matching the pattern by itself does **not**
+/// imply that any strict descendant matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefixMatch {
+    /// At least one non-empty descendant path below the prefix can match the
+    /// pattern.
+    ///
+    /// The contained string is a shortest completion: appending it to the
+    /// prefix (joined with a path separator, unless the prefix is empty)
+    /// yields a path that matches the whole pattern. Characters inside path
+    /// components of the completion are drawn from the caller-supplied
+    /// alphabet; `/` may additionally appear as a component separator.
+    Possible(String),
+    /// No non-empty descendant path below the prefix can match the pattern.
+    Impossible,
+    /// The configured state limit was exceeded while searching for a
+    /// completion, so no verdict could be reached. This is reported instead
+    /// of a potentially incorrect `Impossible`.
+    Indeterminate,
+}
+
+/// Error returned by [`Pattern::prefix_matcher`] when the compiled matcher
+/// would exceed the configured state limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixMatcherError {
+    /// The number of states the compiled matcher would have required.
+    pub required: usize,
+    /// The configured state limit.
+    pub limit: usize,
+}
+
+impl Error for PrefixMatcherError {}
+
+impl fmt::Display for PrefixMatcherError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "prefix matcher requires {} states, which exceeds the limit of {}",
+            self.required, self.limit
+        )
+    }
+}
+
+/// A reusable, compiled form of a [`Pattern`] that decides whether a
+/// directory prefix can still lead to a match.
+///
+/// The matcher is a finite automaton over the pattern's tokens (a state is a
+/// token position together with a follows-separator bit), so checking a
+/// prefix never enumerates the (potentially infinite) space of descendant
+/// paths. The same matcher can be reused for any number of prefixes.
+///
+/// All of the usual pattern features (`*`, `?`, `[...]`, `**`) and all
+/// [`MatchOptions`] (case sensitivity, `require_literal_separator` and
+/// `require_literal_leading_dot`) are honored exactly as by
+/// [`Pattern::matches_with`].
+///
+/// # Examples
+///
+/// ```rust
+/// use glob::{MatchOptions, Pattern, PrefixMatch};
+///
+/// let pattern = Pattern::new("src/**/test?.rs").unwrap();
+/// let matcher = pattern.prefix_matcher(MatchOptions::new(), 1000).unwrap();
+/// let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789._".chars().collect();
+///
+/// // src/ can still lead to a match; the completion is a shortest one.
+/// match matcher.check(&["src"], &alphabet) {
+///     PrefixMatch::Possible(completion) => {
+///         let full = format!("src/{}", completion);
+///         assert!(pattern.matches(&full));
+///     }
+///     other => panic!("expected Possible, got {:?}", other),
+/// }
+///
+/// // docs/ can never lead to a match: prune it.
+/// assert_eq!(matcher.check(&["docs"], &alphabet), PrefixMatch::Impossible);
+/// ```
+#[derive(Debug, Clone)]
+pub struct PrefixMatcher {
+    tokens: Vec<PatternToken>,
+    options: MatchOptions,
+    max_states: usize,
+}
+
+impl Pattern {
+    /// Compile this pattern into a reusable [`PrefixMatcher`].
+    ///
+    /// `max_states` bounds both the number of compiled states
+    /// (`tokens + 1`) and the number of distinct state sets a single
+    /// [`PrefixMatcher::check`] call may explore. If the compiled matcher
+    /// would exceed the limit, a [`PrefixMatcherError`] is returned instead
+    /// of silently producing wrong answers.
+    pub fn prefix_matcher(
+        &self,
+        options: MatchOptions,
+        max_states: usize,
+    ) -> Result<PrefixMatcher, PrefixMatcherError> {
+        let required = self.tokens.len() + 1;
+        if required > max_states {
+            return Err(PrefixMatcherError {
+                required,
+                limit: max_states,
+            });
+        }
+        Ok(PrefixMatcher {
+            tokens: self.tokens.clone(),
+            options,
+            max_states,
+        })
+    }
+}
+
+impl PrefixMatcher {
+    /// The number of compiled states in this matcher.
+    pub fn state_count(&self) -> usize {
+        self.tokens.len() + 1
+    }
+
+    /// Check whether below the directory `prefix_components` there exists at
+    /// least one non-empty descendant path that matches the pattern.
+    ///
+    /// `prefix_components` are literal, normalized path components (not
+    /// patterns), e.g. `&["src", "util"]` for `src/util`. An empty slice
+    /// denotes the current directory. `alphabet` is the finite set of
+    /// characters that may appear inside components of the completion; the
+    /// separator `/` is always available between components.
+    ///
+    /// When the result is `PrefixMatch::Possible(completion)`, joining
+    /// `completion` onto the prefix (with a `/` in between, unless the
+    /// prefix is empty) yields a path that matches the whole pattern, and no
+    /// shorter completion exists over the given alphabet.
+    pub fn check(&self, prefix_components: &[&str], alphabet: &[char]) -> PrefixMatch {
+        use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+        // A state is 2 * token_index + follows_separator.
+        let accept_state = |set: &BTreeSet<usize>| {
+            set.contains(&(2 * self.tokens.len())) || set.contains(&(2 * self.tokens.len() + 1))
+        };
+
+        // Feed the literal prefix into the automaton.
+        let mut current = BTreeSet::new();
+        current.insert(1); // token 0, follows_separator = true
+        self.prefix_closure(&mut current);
+
+        let mut first = true;
+        for component in prefix_components {
+            if !first {
+                current = self.prefix_step(&current, '/');
+            }
+            first = false;
+            for c in component.chars() {
+                current = self.prefix_step(&current, c);
+            }
+            if current.is_empty() {
+                return PrefixMatch::Impossible;
+            }
+        }
+        if !prefix_components.is_empty() {
+            // A descendant path is always separated from its prefix.
+            current = self.prefix_step(&current, '/');
+            if current.is_empty() {
+                return PrefixMatch::Impossible;
+            }
+        }
+
+        // Breadth-first search for a shortest non-empty completion. The
+        // separator is always part of the step alphabet; component
+        // characters come from the caller-supplied alphabet.
+        let mut step_chars: Vec<char> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &c in alphabet.iter().chain(std::iter::once(&'/')) {
+            if seen.insert(c) {
+                step_chars.push(c);
+            }
+        }
+
+        let mut visited: HashSet<BTreeSet<usize>> = HashSet::new();
+        let mut parent: HashMap<BTreeSet<usize>, (BTreeSet<usize>, char)> = HashMap::new();
+        let mut queue: VecDeque<BTreeSet<usize>> = VecDeque::new();
+        visited.insert(current.clone());
+        queue.push_back(current);
+
+        while let Some(set) = queue.pop_front() {
+            for &c in &step_chars {
+                let next = self.prefix_step(&set, c);
+                if next.is_empty() {
+                    continue;
+                }
+                if accept_state(&next) {
+                    let mut completion = String::new();
+                    let mut cursor = &set;
+                    while let Some((prev, step)) = parent.get(cursor) {
+                        completion.push(*step);
+                        cursor = prev;
+                    }
+                    let mut completion: String = completion.chars().rev().collect();
+                    completion.push(c);
+                    return PrefixMatch::Possible(completion);
+                }
+                if !visited.contains(&next) {
+                    if visited.len() >= self.max_states {
+                        return PrefixMatch::Indeterminate;
+                    }
+                    visited.insert(next.clone());
+                    parent.insert(next.clone(), (set.clone(), c));
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        PrefixMatch::Impossible
+    }
+
+    // Add epsilon transitions for `*` (always) and `**` (only right after a
+    // separator, mirroring `matches_from`).
+    fn prefix_closure(&self, states: &mut std::collections::BTreeSet<usize>) {
+        let mut stack: Vec<usize> = states.iter().cloned().collect();
+        while let Some(state) = stack.pop() {
+            let i = state / 2;
+            let follows_separator = state % 2 == 1;
+            if i >= self.tokens.len() {
+                continue;
+            }
+            let target = match self.tokens[i] {
+                AnySequence => Some(2 * (i + 1) + follows_separator as usize),
+                AnyRecursiveSequence if follows_separator => Some(2 * (i + 1) + 1),
+                _ => None,
+            };
+            if let Some(target) = target {
+                if states.insert(target) {
+                    stack.push(target);
+                }
+            }
+        }
+    }
+
+    // Consume one character from every state in `set` and close the result.
+    fn prefix_step(
+        &self,
+        set: &std::collections::BTreeSet<usize>,
+        c: char,
+    ) -> std::collections::BTreeSet<usize> {
+        let mut out = std::collections::BTreeSet::new();
+        let options = &self.options;
+        let is_sep = path::is_separator(c);
+        let sep_blocked = options.require_literal_separator && is_sep;
+        for &state in set {
+            let i = state / 2;
+            let follows_separator = state % 2 == 1;
+            if i >= self.tokens.len() {
+                continue;
+            }
+            let dot_blocked = follows_separator && options.require_literal_leading_dot && c == '.';
+            let advance = 2 * (i + 1) + is_sep as usize;
+            let stay = 2 * i + is_sep as usize;
+            match self.tokens[i] {
+                Char(p) => {
+                    if chars_eq(c, p, options.case_sensitive) {
+                        out.insert(advance);
+                    }
+                }
+                AnyChar => {
+                    if !sep_blocked && !dot_blocked {
+                        out.insert(advance);
+                    }
+                }
+                AnyWithin(ref specifiers) => {
+                    if !sep_blocked && !dot_blocked && in_char_specifiers(specifiers, c, *options) {
+                        out.insert(advance);
+                    }
+                }
+                AnyExcept(ref specifiers) => {
+                    if !sep_blocked && !dot_blocked && !in_char_specifiers(specifiers, c, *options)
+                    {
+                        out.insert(advance);
+                    }
+                }
+                AnySequence => {
+                    if !sep_blocked && !dot_blocked {
+                        out.insert(stay);
+                    }
+                }
+                AnyRecursiveSequence => {
+                    if !dot_blocked {
+                        out.insert(stay);
+                    }
+                }
+            }
+        }
+        self.prefix_closure(&mut out);
+        out
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::{glob, MatchOptions, Pattern};
