@@ -1108,6 +1108,422 @@ impl MatchOptions {
     }
 }
 
+/// A compiled glob pattern *template* with named slots, designed for callers
+/// that repeatedly match against the same pattern shape while the concrete
+/// path segments (e.g. a module or file name) come from external input.
+///
+/// The template is parsed once; each [`bind`](PatternTemplate::bind) call then
+/// splices externally supplied values into a fresh [`Pattern`] without
+/// modifying the compiled template, so one template can be reused for any
+/// number of independent bindings.
+///
+/// # Template syntax
+///
+/// - `{name}` declares a named slot. A slot name must start with `_` or an
+///   alphabetic character, followed by `_`, alphabetic or numeric characters
+///   (Unicode alphabetic characters are allowed). The same name may appear in
+///   several slots; all occurrences are filled from a single binding value.
+/// - `{{` and `}}` are escape sequences producing a literal `{` or `}` in the
+///   resulting glob pattern.
+/// - Glob character classes (`[...]`, `[!...]`) are scanned as a unit, so
+///   braces inside them are ordinary glob characters — except that a
+///   well-formed `{name}` slot inside a character class is rejected with
+///   [`TemplateErrorKind::SlotInCharClass`], because a slot can never expand
+///   to a single character.
+/// - Everything else is ordinary glob syntax as documented on [`Pattern`].
+///
+/// # Binding rules
+///
+/// Every binding value must be a *single path segment*: it must be non-empty,
+/// must not be the parent-directory segment `..`, and must not contain a path
+/// separator (`/` or `\`). Values are escaped with [`Pattern::escape`] before
+/// being spliced into the pattern, so wildcard characters in external input
+/// match literally and can never widen the wildcard structure of the
+/// template. Missing bindings and unknown (extra) bindings are reported
+/// before the pattern is generated.
+///
+/// All error positions (`pos`) are character indices into the original
+/// template string.
+///
+/// # Examples
+///
+/// ```rust
+/// use glob::PatternTemplate;
+///
+/// let template = PatternTemplate::new("src/{module}/**/{name}.rs").unwrap();
+///
+/// // Wildcards coming from external input are matched literally.
+/// let pattern = template.bind(&[("module", "cli"), ("name", "a[1]*")]).unwrap();
+/// assert!(pattern.matches("src/cli/inner/a[1]*.rs"));
+/// assert!(!pattern.matches("src/cli/inner/a1xyz.rs"));
+///
+/// // The same template can be bound again; no state leaks between bindings.
+/// let other = template.bind(&[("module", "web"), ("name", "index")]).unwrap();
+/// assert!(other.matches("src/web/ui/index.rs"));
+/// assert!(!other.matches("src/web/ui/a[1]*.rs"));
+///
+/// // Values must be single path segments.
+/// assert!(template.bind(&[("module", "../etc"), ("name", "x")]).is_err());
+/// ```
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PatternTemplate {
+    original: String,
+    segments: Vec<TemplateSegment>,
+    /// Unique slot names in order of first appearance, each paired with the
+    /// character index of its first occurrence in the original template.
+    slots: Vec<(String, usize)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum TemplateSegment {
+    Literal(String),
+    /// Index into `PatternTemplate::slots`.
+    Slot(usize),
+}
+
+/// An error produced while parsing a [`PatternTemplate`] or binding it to
+/// concrete values.
+#[derive(Debug)]
+#[allow(missing_copy_implementations)]
+pub struct TemplateError {
+    /// The character index in the original template at which the error
+    /// occurred. For [`TemplateErrorKind::ExtraBinding`] there is no template
+    /// position, so this is the character length of the template.
+    pub pos: usize,
+
+    /// The kind of error that occurred.
+    pub kind: TemplateErrorKind,
+}
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Template error near position {}: ", self.pos)?;
+        match &self.kind {
+            TemplateErrorKind::UnclosedSlot => {
+                write!(f, "unclosed slot: missing `}}`")
+            }
+            TemplateErrorKind::EmptySlotName => write!(f, "slot name is empty"),
+            TemplateErrorKind::InvalidSlotName(name) => {
+                write!(f, "invalid slot name `{}`", name)
+            }
+            TemplateErrorKind::SlotInCharClass => {
+                write!(f, "slot may not appear inside a `[...]` character class")
+            }
+            TemplateErrorKind::UnmatchedCloseBrace => {
+                write!(f, "unmatched `}}` (use `}}}}` for a literal brace)")
+            }
+            TemplateErrorKind::MissingBinding(name) => {
+                write!(f, "no binding provided for slot `{}`", name)
+            }
+            TemplateErrorKind::ExtraBinding(name) => {
+                write!(f, "binding `{}` does not match any slot", name)
+            }
+            TemplateErrorKind::EmptyValue(name) => {
+                write!(f, "binding for slot `{}` is empty", name)
+            }
+            TemplateErrorKind::ParentDirectory(name) => {
+                write!(f, "binding for slot `{}` is the parent directory `..`", name)
+            }
+            TemplateErrorKind::ContainsSeparator(name) => {
+                write!(f, "binding for slot `{}` contains a path separator", name)
+            }
+            TemplateErrorKind::InvalidPattern(err) => {
+                write!(f, "invalid glob pattern in template: {}", err)
+            }
+        }
+    }
+}
+
+impl Error for TemplateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            TemplateErrorKind::InvalidPattern(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// The kind of a [`TemplateError`].
+#[derive(Debug)]
+#[allow(missing_copy_implementations)]
+pub enum TemplateErrorKind {
+    /// A `{` started a slot that was never closed by `}`.
+    UnclosedSlot,
+    /// A `{}` slot with an empty name.
+    EmptySlotName,
+    /// A slot name that does not follow the identifier rules. The offending
+    /// name is included.
+    InvalidSlotName(String),
+    /// A `{name}` slot was found inside a `[...]` glob character class.
+    SlotInCharClass,
+    /// A `}` that does not belong to any slot or `}}` escape.
+    UnmatchedCloseBrace,
+    /// A slot of the template was not given a binding. The slot name is
+    /// included.
+    MissingBinding(String),
+    /// A binding was supplied for a name that no slot uses. The binding name
+    /// is included.
+    ExtraBinding(String),
+    /// A binding value was empty. The slot name is included.
+    EmptyValue(String),
+    /// A binding value was the parent-directory segment `..`. The slot name
+    /// is included.
+    ParentDirectory(String),
+    /// A binding value contained a path separator (`/` or `\`). The slot
+    /// name is included.
+    ContainsSeparator(String),
+    /// The literal (non-slot) parts of the template do not form a valid glob
+    /// pattern.
+    InvalidPattern(PatternError),
+}
+
+fn is_valid_slot_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// Check that a binding value is a single path segment: non-empty, not the
+/// parent-directory segment, and free of path separators. Both `/` and `\`
+/// are rejected on every platform so that behaviour is deterministic.
+fn validate_segment_value(name: &str, value: &str) -> Result<(), TemplateErrorKind> {
+    if value.is_empty() {
+        return Err(TemplateErrorKind::EmptyValue(name.to_string()));
+    }
+    if value == ".." {
+        return Err(TemplateErrorKind::ParentDirectory(name.to_string()));
+    }
+    if value.chars().any(|c| c == '/' || c == '\\') {
+        return Err(TemplateErrorKind::ContainsSeparator(name.to_string()));
+    }
+    Ok(())
+}
+
+impl PatternTemplate {
+    /// Compile a template with named slots. See the type-level documentation
+    /// for the template syntax.
+    ///
+    /// A syntactically invalid template yields a [`TemplateError`] whose
+    /// `pos` is a character index into `template`.
+    pub fn new(template: &str) -> Result<Self, TemplateError> {
+        let chars: Vec<char> = template.chars().collect();
+        let mut segments = Vec::new();
+        let mut slots: Vec<(String, usize)> = Vec::new();
+        let mut literal = String::new();
+        let mut i = 0;
+
+        macro_rules! flush_literal {
+            () => {
+                if !literal.is_empty() {
+                    segments.push(TemplateSegment::Literal(std::mem::take(&mut literal)));
+                }
+            };
+        }
+
+        while i < chars.len() {
+            match chars[i] {
+                '{' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                    literal.push('{');
+                    i += 2;
+                }
+                '}' if i + 1 < chars.len() && chars[i + 1] == '}' => {
+                    literal.push('}');
+                    i += 2;
+                }
+                '{' => {
+                    let start = i;
+                    // Scan for the closing brace.
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j] != '}' && chars[j] != '{' {
+                        j += 1;
+                    }
+                    if j >= chars.len() || chars[j] == '{' {
+                        return Err(TemplateError {
+                            pos: start,
+                            kind: TemplateErrorKind::UnclosedSlot,
+                        });
+                    }
+                    let name: String = chars[start + 1..j].iter().collect();
+                    if name.is_empty() {
+                        return Err(TemplateError {
+                            pos: start,
+                            kind: TemplateErrorKind::EmptySlotName,
+                        });
+                    }
+                    if !is_valid_slot_name(&name) {
+                        return Err(TemplateError {
+                            pos: start,
+                            kind: TemplateErrorKind::InvalidSlotName(name),
+                        });
+                    }
+                    flush_literal!();
+                    let index = match slots.iter().position(|(n, _)| *n == name) {
+                        Some(index) => index,
+                        None => {
+                            slots.push((name, start));
+                            slots.len() - 1
+                        }
+                    };
+                    segments.push(TemplateSegment::Slot(index));
+                    i = j + 1;
+                }
+                '}' => {
+                    return Err(TemplateError {
+                        pos: i,
+                        kind: TemplateErrorKind::UnmatchedCloseBrace,
+                    });
+                }
+                '[' => {
+                    // Scan a glob character class as a unit so that braces
+                    // inside it are not mistaken for slots. Follows the glob
+                    // rules: a leading `!` negates, and a `]` immediately
+                    // after `[` or `[!` is a member of the class.
+                    let mut j = i + 1;
+                    if j < chars.len() && chars[j] == '!' {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == ']' {
+                        j += 1;
+                    }
+                    let mut closed = false;
+                    while j < chars.len() {
+                        if chars[j] == ']' {
+                            closed = true;
+                            break;
+                        }
+                        if chars[j] == '{' && slot_name_at(&chars, j).is_some() {
+                            return Err(TemplateError {
+                                pos: j,
+                                kind: TemplateErrorKind::SlotInCharClass,
+                            });
+                        }
+                        j += 1;
+                    }
+                    if closed {
+                        literal.extend(chars[i..=j].iter());
+                        i = j + 1;
+                    } else {
+                        // Unclosed `[`: keep it literal; `Pattern::new` will
+                        // report the invalid glob when the template is bound.
+                        literal.push('[');
+                        i += 1;
+                    }
+                }
+                c => {
+                    literal.push(c);
+                    i += 1;
+                }
+            }
+        }
+        flush_literal!();
+
+        Ok(Self {
+            original: template.to_string(),
+            segments,
+            slots,
+        })
+    }
+
+    /// Access the original template string.
+    pub fn as_str(&self) -> &str {
+        &self.original
+    }
+
+    /// Iterate over the unique slot names of this template, in order of first
+    /// appearance.
+    pub fn slots(&self) -> impl Iterator<Item = &str> + '_ {
+        self.slots.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Bind every slot of this template to a concrete value, producing a
+    /// ready-to-use [`Pattern`].
+    ///
+    /// `bindings` must contain exactly one value for each distinct slot name:
+    /// a missing binding yields [`TemplateErrorKind::MissingBinding`] and a
+    /// binding that no slot uses yields [`TemplateErrorKind::ExtraBinding`];
+    /// both are reported before the pattern is generated. A slot that appears
+    /// several times in the template is filled from its single binding value.
+    ///
+    /// Each value must be a single path segment (see the type-level
+    /// documentation) and is escaped with [`Pattern::escape`], so external
+    /// input can never widen the wildcard structure of the template. The
+    /// compiled template itself is left untouched and can be bound again.
+    pub fn bind(&self, bindings: &[(&str, &str)]) -> Result<Pattern, TemplateError> {
+        // Reject unknown (extra) bindings before generating anything.
+        for (name, _) in bindings {
+            if !self.slots.iter().any(|(slot, _)| slot == name) {
+                return Err(TemplateError {
+                    pos: self.original.chars().count(),
+                    kind: TemplateErrorKind::ExtraBinding(name.to_string()),
+                });
+            }
+        }
+        // Reject missing bindings before generating anything.
+        for (slot, pos) in &self.slots {
+            if !bindings.iter().any(|(name, _)| name == slot) {
+                return Err(TemplateError {
+                    pos: *pos,
+                    kind: TemplateErrorKind::MissingBinding(slot.clone()),
+                });
+            }
+        }
+        // Every value must be a single path segment.
+        for (slot, pos) in &self.slots {
+            let value = bindings
+                .iter()
+                .find(|(name, _)| name == slot)
+                .map(|(_, value)| *value)
+                .unwrap_or("");
+            if let Err(kind) = validate_segment_value(slot, value) {
+                return Err(TemplateError { pos: *pos, kind });
+            }
+        }
+
+        let mut pattern = String::new();
+        for segment in &self.segments {
+            match segment {
+                TemplateSegment::Literal(text) => pattern.push_str(text),
+                TemplateSegment::Slot(index) => {
+                    let (slot, _) = &self.slots[*index];
+                    let value = bindings
+                        .iter()
+                        .find(|(name, _)| name == slot)
+                        .map(|(_, value)| *value)
+                        .unwrap_or("");
+                    pattern.push_str(&Pattern::escape(value));
+                }
+            }
+        }
+
+        Pattern::new(&pattern).map_err(|err| TemplateError {
+            pos: err.pos,
+            kind: TemplateErrorKind::InvalidPattern(err),
+        })
+    }
+}
+
+/// If a well-formed `{name}` slot starts at `chars[start]`, return the index
+/// of its closing brace.
+fn slot_name_at(chars: &[char], start: usize) -> Option<usize> {
+    debug_assert_eq!(chars[start], '{');
+    let mut j = start + 1;
+    while j < chars.len() && chars[j] != '}' && chars[j] != '{' {
+        j += 1;
+    }
+    if j >= chars.len() || chars[j] == '{' {
+        return None;
+    }
+    let name: String = chars[start + 1..j].iter().collect();
+    if is_valid_slot_name(&name) {
+        Some(j)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::{glob, MatchOptions, Pattern};
