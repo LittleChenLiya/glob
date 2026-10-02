@@ -83,6 +83,8 @@ use MatchResult::{EntirePatternDoesntMatch, Match, SubPatternDoesntMatch};
 use PatternToken::AnyExcept;
 use PatternToken::{AnyChar, AnyRecursiveSequence, AnySequence, AnyWithin, Char};
 
+pub mod intersect;
+
 /// An iterator that yields `Path`s from the filesystem that match a particular
 /// pattern.
 ///
