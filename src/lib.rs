@@ -78,6 +78,9 @@ use std::ops::Deref;
 use std::path::{self, Component, Path, PathBuf};
 use std::str::FromStr;
 
+pub mod template;
+pub use template::{BindError, BindErrorKind, PatternTemplate, TemplateError, TemplateErrorKind};
+
 use CharSpecifier::{CharRange, SingleChar};
 use MatchResult::{EntirePatternDoesntMatch, Match, SubPatternDoesntMatch};
 use PatternToken::AnyExcept;
@@ -603,7 +606,7 @@ enum MatchResult {
 const ERROR_WILDCARDS: &str = "wildcards are either regular `*` or recursive `**`";
 const ERROR_RECURSIVE_WILDCARDS: &str = "recursive wildcards must form a single path \
                                          component";
-const ERROR_INVALID_RANGE: &str = "invalid range pattern";
+pub(crate) const ERROR_INVALID_RANGE: &str = "invalid range pattern";
 
 impl Pattern {
     /// This function compiles Unix shell style patterns.
