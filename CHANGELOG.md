@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PatternFilter` in the new `filter` module: a stable, filesystem-free entry
+  point for filtering batches of in-memory path strings against multiple glob
+  patterns. Each result is deduplicated by path identity, keeps the original
+  string for display and matching, reports every pattern it hit in
+  declaration order, and supports an explicit normalizer for the
+  deduplication identity (a normalizer failure rejects the whole batch).
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))

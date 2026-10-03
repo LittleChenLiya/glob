@@ -55,6 +55,11 @@
 //! }
 //! ```
 
+//! In addition to filesystem globbing, the [`filter`] module provides
+//! [`PatternFilter`], a stable entry point for filtering batches of in-memory
+//! path strings against multiple patterns while remembering which pattern each
+//! result hit.
+
 #![doc(
     html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
     html_favicon_url = "https://www.rust-lang.org/favicon.ico",
@@ -65,6 +70,10 @@
 
 #[cfg(test)]
 doc_comment::doctest!("../README.md");
+
+pub mod filter;
+pub use filter::{MatchedPath, NormalizeError, PatternBuildError, PatternFilter};
+
 
 use std::cmp;
 use std::cmp::Ordering;
