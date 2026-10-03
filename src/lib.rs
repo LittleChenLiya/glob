@@ -577,14 +577,35 @@ impl FromStr for Pattern {
     }
 }
 
+/// A byte range into the original pattern string.
+///
+/// All offsets are UTF-8 byte offsets, not character counts. This matters for
+/// non-ASCII patterns (e.g. a Chinese prefix), where a single character can
+/// occupy more than one byte.
+///
+/// The range is half-open: `start` is inclusive and `end` is exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Span {
+    /// The start byte offset (inclusive) of the span.
+    pub start: usize,
+    /// The end byte offset (exclusive) of the span.
+    pub end: usize,
+}
+
+impl Span {
+    fn new(start: usize, end: usize) -> Self {
+        Span { start, end }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum PatternToken {
-    Char(char),
-    AnyChar,
-    AnySequence,
-    AnyRecursiveSequence,
-    AnyWithin(Vec<CharSpecifier>),
-    AnyExcept(Vec<CharSpecifier>),
+    Char(char, Span),
+    AnyChar(Span),
+    AnySequence(Span),
+    AnyRecursiveSequence(Span),
+    AnyWithin(Vec<CharSpecifier>, Span),
+    AnyExcept(Vec<CharSpecifier>, Span),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -611,6 +632,16 @@ impl Pattern {
     /// An invalid glob pattern will yield a `PatternError`.
     pub fn new(pattern: &str) -> Result<Self, PatternError> {
         let chars = pattern.chars().collect::<Vec<_>>();
+        // Byte offsets of each char in `pattern`. This lets the feature report
+        // (and the rest of the parser) report positions as UTF-8 byte offsets
+        // rather than character counts.
+        let offsets = pattern.char_indices().map(|(i, _)| i).collect::<Vec<_>>();
+        let len = pattern.len();
+        let span_at = |i: usize| -> Span {
+            let start = offsets[i];
+            let end = offsets.get(i + 1).copied().unwrap_or(len);
+            Span::new(start, end)
+        };
         let mut tokens = Vec::new();
         let mut is_recursive = false;
         let mut has_metachars = false;
@@ -620,7 +651,7 @@ impl Pattern {
             match chars[i] {
                 '?' => {
                     has_metachars = true;
-                    tokens.push(AnyChar);
+                    tokens.push(AnyChar(span_at(i)));
                     i += 1;
                 }
                 '*' => {
@@ -645,6 +676,8 @@ impl Pattern {
                             // ** can only be an entire path component
                             // i.e. a/**/b is valid, but a**/b or a/**b is not
                             // invalid matches are treated literally
+                            let rec_span =
+                                Span::new(offsets[old], offsets.get(old + 2).copied().unwrap_or(len));
                             let is_valid = if i == 2 || path::is_separator(chars[i - count - 1]) {
                                 // it ends in a '/'
                                 if i < chars.len() && path::is_separator(chars[i]) {
@@ -676,14 +709,17 @@ impl Pattern {
                                 let tokens_len = tokens.len();
 
                                 if !(tokens_len > 1
-                                    && tokens[tokens_len - 1] == AnyRecursiveSequence)
+                                    && matches!(
+                                        tokens[tokens_len - 1],
+                                        AnyRecursiveSequence(..)
+                                    ))
                                 {
                                     is_recursive = true;
-                                    tokens.push(AnyRecursiveSequence);
+                                    tokens.push(AnyRecursiveSequence(rec_span));
                                 }
                             }
                         }
-                        Ordering::Less => tokens.push(AnySequence),
+                        Ordering::Less => tokens.push(AnySequence(span_at(old))),
                     }
                 }
                 '[' => {
@@ -695,8 +731,13 @@ impl Pattern {
                             Some(j) => {
                                 let chars = &chars[i + 2..i + 3 + j];
                                 let cs = parse_char_specifiers(chars);
-                                tokens.push(AnyExcept(cs));
-                                i += j + 4;
+                                let new_i = i + j + 4;
+                                let span = Span::new(
+                                    offsets[i],
+                                    offsets.get(new_i).copied().unwrap_or(len),
+                                );
+                                tokens.push(AnyExcept(cs, span));
+                                i = new_i;
                                 continue;
                             }
                         }
@@ -705,8 +746,13 @@ impl Pattern {
                             None => (),
                             Some(j) => {
                                 let cs = parse_char_specifiers(&chars[i + 1..i + 2 + j]);
-                                tokens.push(AnyWithin(cs));
-                                i += j + 3;
+                                let new_i = i + j + 3;
+                                let span = Span::new(
+                                    offsets[i],
+                                    offsets.get(new_i).copied().unwrap_or(len),
+                                );
+                                tokens.push(AnyWithin(cs, span));
+                                i = new_i;
                                 continue;
                             }
                         }
@@ -719,7 +765,7 @@ impl Pattern {
                     });
                 }
                 c => {
-                    tokens.push(Char(c));
+                    tokens.push(Char(c, span_at(i)));
                     i += 1;
                 }
             }
@@ -806,10 +852,10 @@ impl Pattern {
     ) -> MatchResult {
         for (ti, token) in self.tokens[i..].iter().enumerate() {
             match *token {
-                AnySequence | AnyRecursiveSequence => {
+                AnySequence(..) | AnyRecursiveSequence(..) => {
                     // ** must be at the start.
                     debug_assert!(match *token {
-                        AnyRecursiveSequence => follows_separator,
+                        AnyRecursiveSequence(..) => follows_separator,
                         _ => true,
                     });
 
@@ -825,8 +871,8 @@ impl Pattern {
                         }
                         follows_separator = path::is_separator(c);
                         match *token {
-                            AnyRecursiveSequence if !follows_separator => continue,
-                            AnySequence
+                            AnyRecursiveSequence(..) if !follows_separator => continue,
+                            AnySequence(..)
                                 if options.require_literal_separator && follows_separator =>
                             {
                                 return SubPatternDoesntMatch
@@ -853,7 +899,7 @@ impl Pattern {
                     let is_sep = path::is_separator(c);
 
                     if !match *token {
-                        AnyChar | AnyWithin(..) | AnyExcept(..)
+                        AnyChar(..) | AnyWithin(..) | AnyExcept(..)
                             if (options.require_literal_separator && is_sep)
                                 || (follows_separator
                                     && options.require_literal_leading_dot
@@ -861,11 +907,15 @@ impl Pattern {
                         {
                             false
                         }
-                        AnyChar => true,
-                        AnyWithin(ref specifiers) => in_char_specifiers(specifiers, c, options),
-                        AnyExcept(ref specifiers) => !in_char_specifiers(specifiers, c, options),
-                        Char(c2) => chars_eq(c, c2, options.case_sensitive),
-                        AnySequence | AnyRecursiveSequence => unreachable!(),
+                        AnyChar(..) => true,
+                        AnyWithin(ref specifiers, ..) => {
+                            in_char_specifiers(specifiers, c, options)
+                        }
+                        AnyExcept(ref specifiers, ..) => {
+                            !in_char_specifiers(specifiers, c, options)
+                        }
+                        Char(c2, ..) => chars_eq(c, c2, options.case_sensitive),
+                        AnySequence(..) | AnyRecursiveSequence(..) => unreachable!(),
                     } {
                         return SubPatternDoesntMatch;
                     }
@@ -913,7 +963,7 @@ fn fill_todo(
                 pattern
                     .tokens
                     .iter()
-                    .all(|tok| matches!(tok, PatternToken::Char(_))),
+                    .all(|tok| matches!(tok, PatternToken::Char(..))),
                 "broken invariant: pattern has metachars but shouldn't"
             );
             let s = pattern.as_str();
@@ -971,7 +1021,7 @@ fn fill_todo(
                     // requires that the pattern has a leading dot, even if the
                     // `MatchOptions` field `require_literal_leading_dot` is not
                     // set.
-                    if !pattern.tokens.is_empty() && pattern.tokens[0] == Char('.') {
+                    if !pattern.tokens.is_empty() && matches!(pattern.tokens[0], Char('.', ..)) {
                         for &special in &[".", ".."] {
                             if pattern.matches_with(special, options) {
                                 add(todo, PathWrapper::from_path(path.join(special)));
@@ -1108,9 +1158,258 @@ impl MatchOptions {
     }
 }
 
+/// The syntactic kind of a metacharacter feature found in a glob pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FeatureKind {
+    /// A recursive `**` wildcard that matches across directory boundaries.
+    Recursive,
+    /// A character class, either `[...]` or its negation `[!...]`.
+    CharacterClass,
+}
+
+/// A single metacharacter feature found in a compiled glob pattern.
+///
+/// The `span` is a byte range into the original pattern string (see [`Span`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Feature {
+    /// The kind of feature.
+    pub kind: FeatureKind,
+    /// The byte span of the feature in the original pattern.
+    pub span: Span,
+}
+
+/// The longest literal directory prefix of a pattern.
+///
+/// This is the leading portion of the pattern that consists entirely of literal
+/// path components (components with no metacharacters). It is the directory
+/// that can be descended into directly, without pattern matching, before the
+/// first component that contains a wildcard.
+///
+/// The guarantee expressed by [`is_exact`](LiteralPrefix::is_exact) depends on
+/// the match options: it is only an exact, byte-for-byte guarantee when the
+/// pattern is matched case-sensitively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralPrefix {
+    /// The literal prefix string.
+    pub prefix: String,
+    /// The byte span of the prefix in the original pattern.
+    pub span: Span,
+    /// Whether the prefix is guaranteed to match byte-for-byte.
+    ///
+    /// This is `true` for case-sensitive matching and `false` for
+    /// case-insensitive matching. When `false`, a matched path may use a
+    /// different casing for the prefix, so the string should be treated as a
+    /// case-insensitive hint rather than an exact guarantee.
+    pub is_exact: bool,
+}
+
+/// A read-only report of the static, syntactic features of a glob [`Pattern`].
+///
+/// `PatternFeatures` is produced by [`Pattern::features`] (or
+/// [`Pattern::features_with`]) and describes what the compiled pattern looks
+/// like *without* performing any filesystem access. It reports:
+///
+/// - the locations of recursive `**` wildcards,
+/// - the locations of character classes (`[...]` / `[!...]`), and
+/// - the longest literal directory prefix that can be descended into without
+///   pattern matching.
+///
+/// The report is derived from the tokens the pattern was compiled into, so
+/// escaped metacharacters (e.g. `[*]`, which matches a literal `*`) are reported
+/// as literals rather than as wildcards.
+///
+/// # Case sensitivity
+///
+/// The literal prefix is only an exact, byte-for-byte guarantee when the pattern
+/// is matched case-sensitively. With [`MatchOptions::case_sensitive`] set to
+/// `false`, a matched path may differ in case from the reported prefix, so the
+/// prefix should be treated as a case-insensitive hint. See
+/// [`LiteralPrefix::is_exact`].
+///
+/// # Performance
+///
+/// This report is purely syntactic: it does not traverse the filesystem and
+/// makes no claim about how fast matching will be. It is intended to help
+/// decide how to drive a glob (e.g. where to start reading directories).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternFeatures {
+    features: Vec<Feature>,
+    literal_prefix: Option<LiteralPrefix>,
+}
+
+impl PatternFeatures {
+    /// Returns all metacharacter features in the pattern, in order.
+    pub fn features(&self) -> &[Feature] {
+        &self.features
+    }
+
+    /// Returns an iterator over the recursive `**` features, in order.
+    pub fn recursive(&self) -> impl Iterator<Item = Feature> + '_ {
+        self.features
+            .iter()
+            .copied()
+            .filter(|f| f.kind == FeatureKind::Recursive)
+    }
+
+    /// Returns an iterator over the character class features, in order.
+    pub fn character_classes(&self) -> impl Iterator<Item = Feature> + '_ {
+        self.features
+            .iter()
+            .copied()
+            .filter(|f| f.kind == FeatureKind::CharacterClass)
+    }
+
+    /// Returns `true` if the pattern contains any recursive `**` wildcard.
+    pub fn has_recursive(&self) -> bool {
+        self.features
+            .iter()
+            .any(|f| f.kind == FeatureKind::Recursive)
+    }
+
+    /// Returns `true` if the pattern contains any character class.
+    pub fn has_character_class(&self) -> bool {
+        self.features
+            .iter()
+            .any(|f| f.kind == FeatureKind::CharacterClass)
+    }
+
+    /// Returns the longest literal directory prefix of the pattern, if any.
+    pub fn literal_prefix(&self) -> Option<&LiteralPrefix> {
+        self.literal_prefix.as_ref()
+    }
+}
+
+impl Pattern {
+    /// Returns a read-only report of the static features of this pattern,
+    /// using the default match options.
+    ///
+    /// Equivalent to [`features_with`](Pattern::features_with) with
+    /// [`MatchOptions::new`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use glob::{FeatureKind, Pattern};
+    ///
+    /// let features = Pattern::new("src/**/test[0-9].rs").unwrap().features();
+    /// assert!(features.has_recursive());
+    /// assert!(features.has_character_class());
+    /// let prefix = features.literal_prefix().unwrap();
+    /// assert_eq!(prefix.prefix, "src");
+    /// assert_eq!(prefix.span, glob::Span { start: 0, end: 3 });
+    /// assert!(prefix.is_exact);
+    /// ```
+    pub fn features(&self) -> PatternFeatures {
+        self.features_with(MatchOptions::new())
+    }
+
+    /// Returns a read-only report of the static features of this pattern,
+    /// adjusted for the given match options.
+    ///
+    /// The report is purely syntactic and does not traverse the filesystem.
+    /// The [`LiteralPrefix::is_exact`] field reflects whether the literal
+    /// prefix is guaranteed to match byte-for-byte under `options`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use glob::{MatchOptions, Pattern};
+    ///
+    /// let pattern = Pattern::new("src/**/test.rs").unwrap();
+    ///
+    /// let exact = pattern.features_with(MatchOptions {
+    ///     case_sensitive: true,
+    ///     ..MatchOptions::new()
+    /// });
+    /// assert!(exact.literal_prefix().unwrap().is_exact);
+    ///
+    /// let inexact = pattern.features_with(MatchOptions {
+    ///     case_sensitive: false,
+    ///     ..MatchOptions::new()
+    /// });
+    /// assert!(!inexact.literal_prefix().unwrap().is_exact);
+    /// ```
+    pub fn features_with(&self, options: MatchOptions) -> PatternFeatures {
+        let original = self.as_str();
+        let mut features = Vec::new();
+
+        // Walk the tokens in order. The leading literal prefix is the longest
+        // run of complete path components that consist entirely of `Char`
+        // tokens. A component ends at a path separator.
+        let mut prefix_end: Option<usize> = None;
+        let mut component_is_literal = true;
+        let mut last_token_end = 0usize;
+
+        for token in &self.tokens {
+            let (is_separator, span) = match *token {
+                Char(c, sp) => (path::is_separator(c), sp),
+                AnyChar(sp) | AnySequence(sp) | AnyRecursiveSequence(sp) => (false, sp),
+                AnyWithin(_, sp) | AnyExcept(_, sp) => (false, sp),
+            };
+            last_token_end = span.end;
+
+            if is_separator {
+                if component_is_literal {
+                    // The component before this separator is fully literal; the
+                    // prefix ends just before the separator.
+                    prefix_end = Some(span.start);
+                } else {
+                    // The first non-literal component ends here; the leading
+                    // literal run is over.
+                    break;
+                }
+                component_is_literal = true;
+            } else if !matches!(*token, Char(..)) {
+                // A metacharacter token makes the current component non-literal.
+                component_is_literal = false;
+            }
+
+            // Record the feature for metacharacter tokens.
+            match *token {
+                AnyRecursiveSequence(span) => features.push(Feature {
+                    kind: FeatureKind::Recursive,
+                    span,
+                }),
+                AnyWithin(_, span) | AnyExcept(_, span) => features.push(Feature {
+                    kind: FeatureKind::CharacterClass,
+                    span,
+                }),
+                _ => {}
+            }
+        }
+
+        // If the trailing component (after the last separator) is fully
+        // literal, the prefix extends to the end of the last token.
+        if component_is_literal {
+            prefix_end = Some(last_token_end);
+        }
+
+        let literal_prefix = prefix_end.and_then(|end| {
+            // Trim any trailing separator(s) so the prefix names a directory
+            // rather than ending on a separator.
+            let trimmed = original[..end].trim_end_matches(|c: char| path::is_separator(c));
+            if trimmed.is_empty() {
+                None
+            } else {
+                let new_end = trimmed.len();
+                Some(LiteralPrefix {
+                    prefix: trimmed.to_string(),
+                    span: Span::new(0, new_end),
+                    is_exact: options.case_sensitive,
+                })
+            }
+        });
+
+        PatternFeatures {
+            features,
+            literal_prefix,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{glob, MatchOptions, Pattern};
+    use super::{glob, FeatureKind, MatchOptions, Pattern, Span};
     use std::path::Path;
 
     #[test]
@@ -1516,5 +1815,153 @@ mod test {
     fn test_path_join() {
         let pattern = Path::new("one").join(Path::new("**/*.rs"));
         assert!(Pattern::new(pattern.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_features_recursive_and_character_class() {
+        // src/**/test[0-9].rs: literal prefix `src`, recursive `**`, class `[0-9]`.
+        let pat = Pattern::new("src/**/test[0-9].rs").unwrap();
+        let f = pat.features();
+
+        assert!(f.has_recursive());
+        assert!(f.has_character_class());
+
+        let recursive: Vec<_> = f.recursive().collect();
+        assert_eq!(recursive.len(), 1);
+        assert_eq!(recursive[0].kind, FeatureKind::Recursive);
+        assert_eq!(recursive[0].span, Span { start: 4, end: 6 });
+
+        let classes: Vec<_> = f.character_classes().collect();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].kind, FeatureKind::CharacterClass);
+        assert_eq!(classes[0].span, Span { start: 11, end: 16 });
+
+        let prefix = f.literal_prefix().unwrap();
+        assert_eq!(prefix.prefix, "src");
+        assert_eq!(prefix.span, Span { start: 0, end: 3 });
+        assert!(prefix.is_exact);
+    }
+
+    #[test]
+    fn test_features_escaped_literal_star_not_recursive() {
+        // `[*]` is a character class matching a literal `*`; it must NOT be
+        // reported as a recursive feature.
+        let pat = Pattern::new("a[*]b").unwrap();
+        let f = pat.features();
+        assert!(!f.has_recursive());
+        assert!(f.has_character_class());
+        assert_eq!(f.character_classes().count(), 1);
+        assert_eq!(
+            f.character_classes().next().unwrap().span,
+            Span { start: 1, end: 4 }
+        );
+        // The class breaks the literal prefix, so there is no directory prefix.
+        assert!(f.literal_prefix().is_none());
+
+        // A lone escaped star is likewise a character class, not recursive.
+        let pat = Pattern::new("[*]").unwrap();
+        let f = pat.features();
+        assert!(!f.has_recursive());
+        assert!(f.has_character_class());
+    }
+
+    #[test]
+    fn test_features_literal_prefix_options() {
+        let pat = Pattern::new("src/**/test.rs").unwrap();
+
+        let sensitive = pat.features_with(MatchOptions {
+            case_sensitive: true,
+            ..MatchOptions::new()
+        });
+        assert!(sensitive.literal_prefix().unwrap().is_exact);
+        assert_eq!(sensitive.literal_prefix().unwrap().prefix, "src");
+
+        let insensitive = pat.features_with(MatchOptions {
+            case_sensitive: false,
+            ..MatchOptions::new()
+        });
+        assert!(!insensitive.literal_prefix().unwrap().is_exact);
+        assert_eq!(insensitive.literal_prefix().unwrap().prefix, "src");
+    }
+
+    #[test]
+    fn test_features_invalid_brackets() {
+        // Invalid patterns keep the original error semantics; features() is
+        // only available on a successfully compiled Pattern.
+        for bad in ["abc[def", "abc[!def", "abc[", "abc[]", "abc[!]"] {
+            assert!(Pattern::new(bad).is_err(), "{} should be invalid", bad);
+        }
+    }
+
+    #[test]
+    fn test_features_empty_pattern() {
+        let pat = Pattern::new("").unwrap();
+        let f = pat.features();
+        assert!(!f.has_recursive());
+        assert!(!f.has_character_class());
+        assert!(f.literal_prefix().is_none());
+        assert!(f.features().is_empty());
+    }
+
+    #[test]
+    fn test_features_chinese_prefix_utf8_bytes() {
+        // 中 and 文 are each 3 bytes in UTF-8, so the prefix `中文` occupies
+        // bytes 0..6 (not character offsets).
+        let pat = Pattern::new("中文/**/测试.rs").unwrap();
+        let f = pat.features();
+        let prefix = f.literal_prefix().unwrap();
+        assert_eq!(prefix.prefix, "中文");
+        assert_eq!(prefix.span, Span { start: 0, end: 6 });
+
+        let recursive: Vec<_> = f.recursive().collect();
+        assert_eq!(recursive.len(), 1);
+        assert_eq!(recursive[0].span, Span { start: 7, end: 9 });
+    }
+
+    #[test]
+    fn test_features_literal_prefix_multi_component() {
+        let pat = Pattern::new("src/foo/**/bar").unwrap();
+        let f = pat.features();
+        let prefix = f.literal_prefix().unwrap();
+        assert_eq!(prefix.prefix, "src/foo");
+        assert_eq!(prefix.span, Span { start: 0, end: 7 });
+    }
+
+    #[test]
+    fn test_features_no_literal_prefix_when_first_component_meta() {
+        let pat = Pattern::new("**/foo").unwrap();
+        let f = pat.features();
+        assert!(f.has_recursive());
+        assert!(f.literal_prefix().is_none());
+
+        let pat = Pattern::new("*foo").unwrap();
+        let f = pat.features();
+        assert!(!f.has_recursive());
+        assert!(!f.has_character_class());
+        assert!(f.literal_prefix().is_none());
+    }
+
+    #[test]
+    fn test_features_plain_star_breaks_prefix() {
+        // A regular `*` is not a recursive feature, but it breaks the literal
+        // directory prefix after the first literal component.
+        let pat = Pattern::new("src/f*o/bar").unwrap();
+        let f = pat.features();
+        assert!(!f.has_recursive());
+        assert!(!f.has_character_class());
+        let prefix = f.literal_prefix().unwrap();
+        assert_eq!(prefix.prefix, "src");
+        assert_eq!(prefix.span, Span { start: 0, end: 3 });
+    }
+
+    #[test]
+    fn test_features_fully_literal_pattern() {
+        let pat = Pattern::new("foo/bar/baz.rs").unwrap();
+        let f = pat.features();
+        assert!(!f.has_recursive());
+        assert!(!f.has_character_class());
+        let prefix = f.literal_prefix().unwrap();
+        assert_eq!(prefix.prefix, "foo/bar/baz.rs");
+        assert_eq!(prefix.span, Span { start: 0, end: 14 });
     }
 }

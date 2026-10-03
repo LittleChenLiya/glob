@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `Pattern::features` / `Pattern::features_with`, a read-only report of a
+  pattern's recursive `**` wildcards, character classes, and longest literal
+  directory prefix. Positions are UTF-8 byte offsets; escaped metacharacters
+  (e.g. `[*]`) are reported as literals. A `features` example demonstrates the
+  report alongside real matching.
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))
