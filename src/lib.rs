@@ -63,6 +63,11 @@
 #![deny(missing_docs)]
 #![allow(clippy::while_let_loop)]
 
+/// Stable, in-memory multi-pattern path filtering.
+///
+/// See the [`filter`] module for details.
+pub mod filter;
+
 #[cfg(test)]
 doc_comment::doctest!("../README.md");
 
