@@ -83,6 +83,9 @@ use MatchResult::{EntirePatternDoesntMatch, Match, SubPatternDoesntMatch};
 use PatternToken::AnyExcept;
 use PatternToken::{AnyChar, AnyRecursiveSequence, AnySequence, AnyWithin, Char};
 
+pub mod remap;
+pub use remap::{Capture, CaptureKind, Mapping, RemapError, RemapPlanner, RemapRule, UnsafeReason};
+
 /// An iterator that yields `Path`s from the filesystem that match a particular
 /// pattern.
 ///
@@ -588,7 +591,7 @@ enum PatternToken {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum CharSpecifier {
+pub(crate) enum CharSpecifier {
     SingleChar(char),
     CharRange(char, char),
 }
@@ -993,7 +996,7 @@ fn fill_todo(
     }
 }
 
-fn parse_char_specifiers(s: &[char]) -> Vec<CharSpecifier> {
+pub(crate) fn parse_char_specifiers(s: &[char]) -> Vec<CharSpecifier> {
     let mut cs = Vec::new();
     let mut i = 0;
     while i < s.len() {
@@ -1008,7 +1011,7 @@ fn parse_char_specifiers(s: &[char]) -> Vec<CharSpecifier> {
     cs
 }
 
-fn in_char_specifiers(specifiers: &[CharSpecifier], c: char, options: MatchOptions) -> bool {
+pub(crate) fn in_char_specifiers(specifiers: &[CharSpecifier], c: char, options: MatchOptions) -> bool {
     for &specifier in specifiers.iter() {
         match specifier {
             SingleChar(sc) => {
