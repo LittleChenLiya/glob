@@ -63,6 +63,8 @@
 #![deny(missing_docs)]
 #![allow(clippy::while_let_loop)]
 
+pub mod batch;
+
 #[cfg(test)]
 doc_comment::doctest!("../README.md");
 
