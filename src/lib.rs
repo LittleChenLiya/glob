@@ -66,6 +66,11 @@
 #[cfg(test)]
 doc_comment::doctest!("../README.md");
 
+/// Path remapping planner: named single- and cross-segment captures plus
+/// target templates, with `Pattern`-validated plans and target safety
+/// checks. See [`remap::RemapPlanner`] for details.
+pub mod remap;
+
 use std::cmp;
 use std::cmp::Ordering;
 use std::error::Error;

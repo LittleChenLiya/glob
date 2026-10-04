@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the `remap` module: a path remapping planner with named
+  single-component `{name:*}` and cross-component `{dir:**}` captures,
+  declaration-order first-match rules, longest-cross-segment/leftmost
+  capture disambiguation, `Pattern` re-validation, target safety checks
+  (empty captures, reserved characters and device names, path traversal,
+  Windows case folding) and same-target conflict rejection.
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))
