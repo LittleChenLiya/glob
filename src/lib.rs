@@ -83,6 +83,9 @@ use MatchResult::{EntirePatternDoesntMatch, Match, SubPatternDoesntMatch};
 use PatternToken::AnyExcept;
 use PatternToken::{AnyChar, AnyRecursiveSequence, AnySequence, AnyWithin, Char};
 
+mod diff;
+pub use crate::diff::{diff_match_options, diff_patterns, DiffReason, OptionsDiff, Witness};
+
 /// An iterator that yields `Path`s from the filesystem that match a particular
 /// pattern.
 ///
