@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Backslash escapes for glob metacharacters (`\?`, `\*`, `\[`, `\]`, `\\`);
+  the escaped character is matched literally. A backslash before any other
+  character (e.g. a Windows path separator) keeps its ordinary meaning.
+- An explicit structural index of a compiled pattern, available through
+  `Pattern::index()` and `Pattern::segments()`: the source is partitioned
+  into typed segments (literal text, backslash escapes, character classes,
+  and `*`/`**`/`?` wildcard segments), each carrying its original UTF-8 byte
+  range and decoded literal value. The index is produced by the pattern
+  parser itself, and a `*` inside a character class or after a backslash is
+  never a wildcard.
+- `Pattern::replace_literal_segment()` edits one literal segment after
+  verifying the pattern against the index baseline; after recompiling, all
+  non-target segments must keep the same structure (only byte ranges may
+  shift), and stale indexes are rejected.
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))
