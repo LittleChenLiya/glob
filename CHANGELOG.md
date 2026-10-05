@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `batch::BatchScanner`: an explicit, batched glob scanner that returns a
+  bounded number of matches per batch, follows the existing glob matching rules
+  in deterministic relative-path order, and produces a persistent resume
+  cursor. Cursors are bound to the pattern, match options and scan root
+  (changing any of them rejects recovery), never re-deliver returned paths, and
+  report observed directory additions/removals (with fingerprints and
+  percent-encoded names) when a resumed directory changed, marking such batches
+  as not snapshot-consistent.
+
 ## [0.3.4](https://github.com/rust-lang/glob/compare/v0.3.3...v0.3.4) - 2026-07-21
 
 - Cache filename for sorting in `fill_todo` ([#181](https://github.com/rust-lang/glob/pull/181))

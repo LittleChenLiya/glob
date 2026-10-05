@@ -66,6 +66,8 @@
 #[cfg(test)]
 doc_comment::doctest!("../README.md");
 
+pub mod batch;
+
 use std::cmp;
 use std::cmp::Ordering;
 use std::error::Error;
@@ -295,6 +297,10 @@ impl GlobError {
         &self.error
     }
 
+    pub(crate) fn new(path: PathBuf, error: io::Error) -> GlobError {
+        GlobError { path, error }
+    }
+
     /// Consumes self, returning the _raw_ underlying `io::Error`
     #[deprecated(note = "use `.into` instead")]
     pub fn into_error(self) -> io::Error {
@@ -505,6 +511,12 @@ pub struct PatternError {
 
     /// A message describing the error.
     pub msg: &'static str,
+}
+
+impl PatternError {
+    pub(crate) fn new(pos: usize, msg: &'static str) -> PatternError {
+        PatternError { pos, msg }
+    }
 }
 
 impl Error for PatternError {
@@ -795,6 +807,12 @@ impl Pattern {
     /// Access the original glob pattern.
     pub fn as_str(&self) -> &str {
         &self.original
+    }
+
+    /// Whether this pattern component is the recursive `**` sequence. Used by
+    /// the batched scanner to drive its depth-first traversal.
+    pub fn is_recursive_pattern(&self) -> bool {
+        self.is_recursive
     }
 
     fn matches_from(
