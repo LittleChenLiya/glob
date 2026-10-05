@@ -257,6 +257,7 @@ pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternE
             tokens: Vec::new(),
             is_recursive: false,
             has_metachars: false,
+            segments: Vec::new(),
         });
     }
 
@@ -560,6 +561,8 @@ pub struct Pattern {
     /// A bool value that indicates whether the pattern contains any metacharacters.
     /// We use this information for some fast path optimizations.
     has_metachars: bool,
+    /// The structure segments of this pattern, recorded by the parser.
+    segments: Vec<PatternSegment>,
 }
 
 /// Show the original glob pattern.
@@ -574,6 +577,187 @@ impl FromStr for Pattern {
 
     fn from_str(s: &str) -> Result<Self, PatternError> {
         Self::new(s)
+    }
+}
+
+/// A single segment of a compiled [`Pattern`], as recorded by a [`PatternIndex`].
+///
+/// Each segment records the byte range it occupies in the original pattern
+/// text and its decoded literal value. Literal segments group together runs
+/// of ordinary characters; escape segments record a backslash-escaped
+/// metacharacter; character-class segments record a `[...]` bracket expression
+/// (including negated classes); wildcard segments record `*`, `**`, or `?`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct PatternSegment {
+    kind: SegmentKind,
+    start: usize,
+    end: usize,
+    decoded: String,
+}
+
+impl PatternSegment {
+    /// Returns the kind of this segment.
+    pub fn kind(&self) -> SegmentKind {
+        self.kind
+    }
+
+    /// Returns the byte start offset of this segment in the original pattern.
+    ///
+    /// The offset is measured in bytes from the beginning of the pattern's
+    /// UTF-8 encoded text.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Returns the byte end offset (exclusive) of this segment in the original
+    /// pattern.
+    ///
+    /// The offset is measured in bytes from the beginning of the pattern's
+    /// UTF-8 encoded text.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Returns the decoded literal value of this segment.
+    ///
+    /// For literal and escape segments, this is the literal text they match.
+    /// For character classes and wildcards, this is the original text of the
+    /// segment (since they do not decode to a single literal).
+    pub fn decoded(&self) -> &str {
+        &self.decoded
+    }
+}
+
+/// The kind of a segment in a [`PatternIndex`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum SegmentKind {
+    /// A run of literal characters.
+    Literal,
+    /// A backslash-escaped metacharacter, e.g. `\*` or `\?`.
+    Escape,
+    /// A character class, e.g. `[a-z]` or `[!abc]`.
+    CharClass,
+    /// A wildcard, e.g. `*`, `**`, or `?`.
+    Wildcard,
+}
+
+/// A structure index for a compiled [`Pattern`].
+///
+/// `PatternIndex` breaks a pattern down into a sequence of typed segments,
+/// each recording its byte range in the original pattern text and its
+/// decoded literal value. The index is produced by the same parser that
+/// compiles the pattern, so it accurately reflects the pattern's structure
+/// (for example, a `*` inside a character class is recorded as part of the
+/// class, not as a wildcard).
+///
+/// This is useful for tooling that needs to inspect or edit specific parts
+/// of a pattern while verifying that the underlying pattern has not changed.
+///
+/// # Examples
+///
+/// ```rust
+/// use glob::Pattern;
+///
+/// let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+/// let index = pattern.index();
+///
+/// assert_eq!(index.baseline(), "a\\*/[x*]/b?");
+/// assert_eq!(index.len(), 6);
+/// ```
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PatternIndex {
+    baseline: String,
+    segments: Vec<PatternSegment>,
+}
+
+impl PatternIndex {
+    /// Returns the original pattern text that this index was built from.
+    pub fn baseline(&self) -> &str {
+        &self.baseline
+    }
+
+    /// Returns the segments of this index, in order.
+    pub fn segments(&self) -> &[PatternSegment] {
+        &self.segments
+    }
+
+    /// Returns the number of segments in this index.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns `true` if this index has no segments.
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Verifies that this index is still valid for the given pattern.
+    ///
+    /// Returns `true` if the pattern's original text matches the baseline
+    /// this index was built from. Use this to detect when a pattern has
+    /// been changed in a way that invalidates the index (for example, after
+    /// editing a different part of the pattern).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use glob::Pattern;
+    ///
+    /// let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+    /// let index = pattern.index();
+    /// assert!(index.verify(&pattern));
+    ///
+    /// let changed = Pattern::new("x\\*/[x*]/b?").unwrap();
+    /// assert!(!index.verify(&changed));
+    /// ```
+    pub fn verify(&self, pattern: &Pattern) -> bool {
+        pattern.as_str() == self.baseline
+    }
+
+    /// Edits the literal segment at the given index, replacing its text with
+    /// the given value.
+    ///
+    /// The new value is escaped (using [`Pattern::escape`]) so that it remains
+    /// a literal segment. The rest of the pattern is left unchanged. Returns a
+    /// new compiled pattern, or an error if the segment is not a literal or
+    /// the edited pattern fails to compile.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use glob::Pattern;
+    ///
+    /// let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+    /// let index = pattern.index();
+    ///
+    /// // Edit the first literal segment ("a") to "a2".
+    /// let edited = index.edit_literal(0, "a2").unwrap();
+    /// assert_eq!(edited.as_str(), "a2\\*/[x*]/b?");
+    ///
+    /// // The escaped asterisk is still a literal after the edit.
+    /// assert!(edited.matches("a2*/x/b?"));
+    /// ```
+    pub fn edit_literal(
+        &self,
+        segment_idx: usize,
+        new_value: &str,
+    ) -> Result<Pattern, PatternError> {
+        let segment = self.segments.get(segment_idx).ok_or(PatternError {
+            pos: 0,
+            msg: "segment index out of bounds",
+        })?;
+        if segment.kind != SegmentKind::Literal {
+            return Err(PatternError {
+                pos: segment.start,
+                msg: "segment is not a literal",
+            });
+        }
+        let escaped = Pattern::escape(new_value);
+        let mut new_pattern = String::with_capacity(self.baseline.len() + escaped.len());
+        new_pattern.push_str(&self.baseline[..segment.start]);
+        new_pattern.push_str(&escaped);
+        new_pattern.push_str(&self.baseline[segment.end..]);
+        Pattern::new(&new_pattern)
     }
 }
 
@@ -611,19 +795,67 @@ impl Pattern {
     /// An invalid glob pattern will yield a `PatternError`.
     pub fn new(pattern: &str) -> Result<Self, PatternError> {
         let chars = pattern.chars().collect::<Vec<_>>();
+        // Byte offset of each char in the original UTF-8 pattern text.
+        let byte_offsets: Vec<usize> = {
+            let mut offsets = Vec::with_capacity(chars.len());
+            let mut pos = 0;
+            for c in &chars {
+                offsets.push(pos);
+                pos += c.len_utf8();
+            }
+            offsets
+        };
         let mut tokens = Vec::new();
+        let mut segments = Vec::new();
         let mut is_recursive = false;
         let mut has_metachars = false;
         let mut i = 0;
+        // Start char index of the current literal run, if any.
+        let mut literal_start: Option<usize> = None;
+
+        // Flush a pending literal run into a Literal segment.
+        macro_rules! flush_literal {
+            ($end:expr) => {
+                if let Some(start) = literal_start.take() {
+                    let start_byte = byte_offsets[start];
+                    let end_byte = if $end < chars.len() {
+                        byte_offsets[$end]
+                    } else {
+                        pattern.len()
+                    };
+                    let decoded: String = chars[start..$end].iter().collect();
+                    segments.push(PatternSegment {
+                        kind: SegmentKind::Literal,
+                        start: start_byte,
+                        end: end_byte,
+                        decoded,
+                    });
+                }
+            };
+        }
 
         while i < chars.len() {
             match chars[i] {
                 '?' => {
+                    flush_literal!(i);
                     has_metachars = true;
                     tokens.push(AnyChar);
+                    let start_byte = byte_offsets[i];
                     i += 1;
+                    let end_byte = if i < chars.len() {
+                        byte_offsets[i]
+                    } else {
+                        pattern.len()
+                    };
+                    segments.push(PatternSegment {
+                        kind: SegmentKind::Wildcard,
+                        start: start_byte,
+                        end: end_byte,
+                        decoded: "?".to_string(),
+                    });
                 }
                 '*' => {
+                    flush_literal!(i);
                     has_metachars = true;
 
                     let old = i;
@@ -633,6 +865,13 @@ impl Pattern {
                     }
 
                     let count = i - old;
+                    let star_end = i;
+                    let start_byte = byte_offsets[old];
+                    let end_byte = if star_end < chars.len() {
+                        byte_offsets[star_end]
+                    } else {
+                        pattern.len()
+                    };
 
                     match count.cmp(&2) {
                         Ordering::Greater => {
@@ -645,19 +884,21 @@ impl Pattern {
                             // ** can only be an entire path component
                             // i.e. a/**/b is valid, but a**/b or a/**b is not
                             // invalid matches are treated literally
-                            let is_valid = if i == 2 || path::is_separator(chars[i - count - 1]) {
+                            let is_valid = if star_end == 2
+                                || path::is_separator(chars[star_end - count - 1])
+                            {
                                 // it ends in a '/'
-                                if i < chars.len() && path::is_separator(chars[i]) {
+                                if star_end < chars.len() && path::is_separator(chars[star_end]) {
                                     i += 1;
                                     true
                                 // or the pattern ends here
                                 // this enables the existing globbing mechanism
-                                } else if i == chars.len() {
+                                } else if star_end == chars.len() {
                                     true
                                 // `**` ends in non-separator
                                 } else {
                                     return Err(PatternError {
-                                        pos: i,
+                                        pos: star_end,
                                         msg: ERROR_RECURSIVE_WILDCARDS,
                                     });
                                 }
@@ -681,22 +922,51 @@ impl Pattern {
                                     is_recursive = true;
                                     tokens.push(AnyRecursiveSequence);
                                 }
+
+                                segments.push(PatternSegment {
+                                    kind: SegmentKind::Wildcard,
+                                    start: start_byte,
+                                    end: end_byte,
+                                    decoded: "**".to_string(),
+                                });
                             }
                         }
-                        Ordering::Less => tokens.push(AnySequence),
+                        Ordering::Less => {
+                            tokens.push(AnySequence);
+                            segments.push(PatternSegment {
+                                kind: SegmentKind::Wildcard,
+                                start: start_byte,
+                                end: end_byte,
+                                decoded: "*".to_string(),
+                            });
+                        }
                     }
                 }
                 '[' => {
+                    flush_literal!(i);
                     has_metachars = true;
+                    let class_start = i;
 
                     if i + 4 <= chars.len() && chars[i + 1] == '!' {
                         match chars[i + 3..].iter().position(|x| *x == ']') {
                             None => (),
                             Some(j) => {
-                                let chars = &chars[i + 2..i + 3 + j];
-                                let cs = parse_char_specifiers(chars);
+                                let specifier_chars = &chars[i + 2..i + 3 + j];
+                                let cs = parse_char_specifiers(specifier_chars);
                                 tokens.push(AnyExcept(cs));
                                 i += j + 4;
+                                let end_byte = if i < chars.len() {
+                                    byte_offsets[i]
+                                } else {
+                                    pattern.len()
+                                };
+                                segments.push(PatternSegment {
+                                    kind: SegmentKind::CharClass,
+                                    start: byte_offsets[class_start],
+                                    end: end_byte,
+                                    decoded: pattern[byte_offsets[class_start]..end_byte]
+                                        .to_string(),
+                                });
                                 continue;
                             }
                         }
@@ -707,6 +977,18 @@ impl Pattern {
                                 let cs = parse_char_specifiers(&chars[i + 1..i + 2 + j]);
                                 tokens.push(AnyWithin(cs));
                                 i += j + 3;
+                                let end_byte = if i < chars.len() {
+                                    byte_offsets[i]
+                                } else {
+                                    pattern.len()
+                                };
+                                segments.push(PatternSegment {
+                                    kind: SegmentKind::CharClass,
+                                    start: byte_offsets[class_start],
+                                    end: end_byte,
+                                    decoded: pattern[byte_offsets[class_start]..end_byte]
+                                        .to_string(),
+                                });
                                 continue;
                             }
                         }
@@ -718,19 +1000,67 @@ impl Pattern {
                         msg: ERROR_INVALID_RANGE,
                     });
                 }
+                '\\' => {
+                    // A backslash followed by a metacharacter is an escape.
+                    if i + 1 < chars.len()
+                        && matches!(chars[i + 1], '*' | '?' | '[' | ']' | '\\')
+                    {
+                        flush_literal!(i);
+                        let escaped = chars[i + 1];
+                        tokens.push(Char(escaped));
+                        let start_byte = byte_offsets[i];
+                        i += 2;
+                        let end_byte = if i < chars.len() {
+                            byte_offsets[i]
+                        } else {
+                            pattern.len()
+                        };
+                        segments.push(PatternSegment {
+                            kind: SegmentKind::Escape,
+                            start: start_byte,
+                            end: end_byte,
+                            decoded: escaped.to_string(),
+                        });
+                    } else {
+                        // A backslash not followed by a metachar is a literal.
+                        if literal_start.is_none() {
+                            literal_start = Some(i);
+                        }
+                        tokens.push(Char('\\'));
+                        i += 1;
+                    }
+                }
                 c => {
+                    if literal_start.is_none() {
+                        literal_start = Some(i);
+                    }
                     tokens.push(Char(c));
                     i += 1;
                 }
             }
         }
 
+        flush_literal!(chars.len());
+
         Ok(Self {
             tokens,
             original: pattern.to_string(),
             is_recursive,
             has_metachars,
+            segments,
         })
+    }
+
+    /// Builds a structure index for this pattern.
+    ///
+    /// The index breaks the pattern down into typed segments (literal text,
+    /// escapes, character classes, and wildcards), each recording its byte
+    /// range in the original pattern text and its decoded literal value.
+    pub fn index(&self) -> PatternIndex {
+        PatternIndex {
+            baseline: self.original.clone(),
+            segments: self.segments.clone(),
+        }
     }
 
     /// Escape metacharacters within the given string by surrounding them in
@@ -1110,7 +1440,7 @@ impl MatchOptions {
 
 #[cfg(test)]
 mod test {
-    use super::{glob, MatchOptions, Pattern};
+    use super::{glob, MatchOptions, Pattern, SegmentKind};
     use std::path::Path;
 
     #[test]
@@ -1516,5 +1846,283 @@ mod test {
     fn test_path_join() {
         let pattern = Path::new("one").join(Path::new("**/*.rs"));
         assert!(Pattern::new(pattern.to_str().unwrap()).is_ok());
+    }
+
+    // --- Pattern structure index tests ---
+
+    #[test]
+    fn test_pattern_index_classification() {
+        // Pattern: a\*/[x*]/b?
+        // Expected segments (the char class [x*] sits between two literal
+        // runs, so "/" and "b" do NOT merge across it):
+        //   Literal("a")  [0..1]
+        //   Escape("*")   [1..3]
+        //   Literal("/")  [3..4]
+        //   CharClass     [4..8]  decoded "[x*]"
+        //   Literal("/b") [8..10]
+        //   Wildcard("?") [10..11]
+        let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+        let index = pattern.index();
+
+        assert_eq!(index.baseline(), "a\\*/[x*]/b?");
+        assert_eq!(index.len(), 6);
+
+        let segs = index.segments();
+        assert_eq!(segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(segs[0].start(), 0);
+        assert_eq!(segs[0].end(), 1);
+        assert_eq!(segs[0].decoded(), "a");
+
+        assert_eq!(segs[1].kind(), SegmentKind::Escape);
+        assert_eq!(segs[1].start(), 1);
+        assert_eq!(segs[1].end(), 3);
+        assert_eq!(segs[1].decoded(), "*");
+
+        assert_eq!(segs[2].kind(), SegmentKind::Literal);
+        assert_eq!(segs[2].start(), 3);
+        assert_eq!(segs[2].end(), 4);
+        assert_eq!(segs[2].decoded(), "/");
+
+        assert_eq!(segs[3].kind(), SegmentKind::CharClass);
+        assert_eq!(segs[3].start(), 4);
+        assert_eq!(segs[3].end(), 8);
+        assert_eq!(segs[3].decoded(), "[x*]");
+
+        assert_eq!(segs[4].kind(), SegmentKind::Literal);
+        assert_eq!(segs[4].start(), 8);
+        assert_eq!(segs[4].end(), 10);
+        assert_eq!(segs[4].decoded(), "/b");
+
+        assert_eq!(segs[5].kind(), SegmentKind::Wildcard);
+        assert_eq!(segs[5].start(), 10);
+        assert_eq!(segs[5].end(), 11);
+        assert_eq!(segs[5].decoded(), "?");
+    }
+
+    #[test]
+    fn test_pattern_index_edit_literal() {
+        let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+        let index = pattern.index();
+
+        // Edit the first literal segment ("a") to "a2".
+        let edited = index.edit_literal(0, "a2").unwrap();
+        assert_eq!(edited.as_str(), "a2\\*/[x*]/b?");
+
+        // The escaped asterisk is still a literal after the edit.
+        assert!(edited.matches("a2*/x/b?"));
+        assert!(!edited.matches("a2X/x/b?"));
+
+        // Re-index the edited pattern and verify non-target segments kept
+        // their structure (kind and decoded value).
+        let edited_index = edited.index();
+        let edited_segs = edited_index.segments();
+
+        // Segment 0 changed from "a" to "a2".
+        assert_eq!(edited_segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(edited_segs[0].decoded(), "a2");
+
+        // Segment 1 (escape) is unchanged in kind and decoded value.
+        assert_eq!(edited_segs[1].kind(), SegmentKind::Escape);
+        assert_eq!(edited_segs[1].decoded(), "*");
+
+        // Segment 3 (char class) is unchanged.
+        assert_eq!(edited_segs[3].kind(), SegmentKind::CharClass);
+        assert_eq!(edited_segs[3].decoded(), "[x*]");
+
+        // Segment 5 (wildcard "?") is unchanged.
+        assert_eq!(edited_segs[5].kind(), SegmentKind::Wildcard);
+        assert_eq!(edited_segs[5].decoded(), "?");
+    }
+
+    #[test]
+    fn test_pattern_index_edit_literal_escapes_metachars() {
+        let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+        let index = pattern.index();
+
+        // Edit "a" to a value containing metacharacters; they must be escaped
+        // so the segment remains a literal.
+        let edited = index.edit_literal(0, "a*").unwrap();
+        assert_eq!(edited.as_str(), "a[*]\\*/[x*]/b?");
+        assert!(edited.matches("a**/x/b?"));
+        assert!(!edited.matches("aXX/x/b?"));
+    }
+
+    #[test]
+    fn test_pattern_index_verify_rejects_changed_baseline() {
+        let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+        let index = pattern.index();
+        assert!(index.verify(&pattern));
+
+        // Change the baseline; the old index must be rejected.
+        let changed = Pattern::new("x\\*/[x*]/b?").unwrap();
+        assert!(!index.verify(&changed));
+
+        // The index still verifies against the original pattern.
+        assert!(index.verify(&pattern));
+    }
+
+    #[test]
+    fn test_pattern_index_unicode_byte_ranges() {
+        // "é" is 2 bytes in UTF-8.
+        let pattern = Pattern::new("é\\*/b?").unwrap();
+        let index = pattern.index();
+        let segs = index.segments();
+
+        assert_eq!(segs.len(), 4);
+
+        assert_eq!(segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(segs[0].start(), 0);
+        assert_eq!(segs[0].end(), 2);
+        assert_eq!(segs[0].decoded(), "é");
+
+        assert_eq!(segs[1].kind(), SegmentKind::Escape);
+        assert_eq!(segs[1].start(), 2);
+        assert_eq!(segs[1].end(), 4);
+        assert_eq!(segs[1].decoded(), "*");
+
+        assert_eq!(segs[2].kind(), SegmentKind::Literal);
+        assert_eq!(segs[2].start(), 4);
+        assert_eq!(segs[2].end(), 6);
+        assert_eq!(segs[2].decoded(), "/b");
+
+        assert_eq!(segs[3].kind(), SegmentKind::Wildcard);
+        assert_eq!(segs[3].start(), 6);
+        assert_eq!(segs[3].end(), 7);
+        assert_eq!(segs[3].decoded(), "?");
+    }
+
+    #[test]
+    fn test_pattern_index_charclass_star_not_wildcard() {
+        // The `*` inside `[x*]` is part of the character class, not a wildcard.
+        let pattern = Pattern::new("a[x*]b?").unwrap();
+        let index = pattern.index();
+        let segs = index.segments();
+
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(segs[0].decoded(), "a");
+
+        assert_eq!(segs[1].kind(), SegmentKind::CharClass);
+        assert_eq!(segs[1].decoded(), "[x*]");
+
+        assert_eq!(segs[2].kind(), SegmentKind::Literal);
+        assert_eq!(segs[2].decoded(), "b");
+
+        assert_eq!(segs[3].kind(), SegmentKind::Wildcard);
+        assert_eq!(segs[3].decoded(), "?");
+
+        // The pattern matches "a*b?" (the class matches the literal `*`).
+        assert!(pattern.matches("a*b?"));
+        assert!(pattern.matches("axb?"));
+        assert!(!pattern.matches("aXb?"));
+    }
+
+    #[test]
+    fn test_pattern_index_negated_charclass() {
+        let pattern = Pattern::new("a[!x]b").unwrap();
+        let index = pattern.index();
+        let segs = index.segments();
+
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[1].kind(), SegmentKind::CharClass);
+        assert_eq!(segs[1].decoded(), "[!x]");
+    }
+
+    #[test]
+    fn test_pattern_index_escape_variants() {
+        let pattern = Pattern::new("a\\*b\\?c\\[d\\]e\\\\f").unwrap();
+        let index = pattern.index();
+        let segs = index.segments();
+
+        // a, \*, b, \?, c, \[, d, \], e, \\, f
+        assert_eq!(segs.len(), 11);
+        assert_eq!(segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(segs[0].decoded(), "a");
+        assert_eq!(segs[1].kind(), SegmentKind::Escape);
+        assert_eq!(segs[1].decoded(), "*");
+        assert_eq!(segs[2].kind(), SegmentKind::Literal);
+        assert_eq!(segs[2].decoded(), "b");
+        assert_eq!(segs[3].kind(), SegmentKind::Escape);
+        assert_eq!(segs[3].decoded(), "?");
+        assert_eq!(segs[4].kind(), SegmentKind::Literal);
+        assert_eq!(segs[4].decoded(), "c");
+        assert_eq!(segs[5].kind(), SegmentKind::Escape);
+        assert_eq!(segs[5].decoded(), "[");
+        assert_eq!(segs[6].kind(), SegmentKind::Literal);
+        assert_eq!(segs[6].decoded(), "d");
+        assert_eq!(segs[7].kind(), SegmentKind::Escape);
+        assert_eq!(segs[7].decoded(), "]");
+        assert_eq!(segs[8].kind(), SegmentKind::Literal);
+        assert_eq!(segs[8].decoded(), "e");
+        assert_eq!(segs[9].kind(), SegmentKind::Escape);
+        assert_eq!(segs[9].decoded(), "\\");
+        assert_eq!(segs[10].kind(), SegmentKind::Literal);
+        assert_eq!(segs[10].decoded(), "f");
+
+        // The pattern matches "a*b?c[d]e\f" where each metachar is literal.
+        assert!(pattern.matches("a*b?c[d]e\\f"));
+    }
+
+    #[test]
+    fn test_pattern_index_wildcards() {
+        // `**` must form a single path component, so use `a/**/c?d`.
+        let pattern = Pattern::new("a/**/c?d").unwrap();
+        let index = pattern.index();
+        let segs = index.segments();
+
+        // a/, **, c, ?, d
+        assert_eq!(segs.len(), 5);
+        assert_eq!(segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(segs[0].decoded(), "a/");
+        assert_eq!(segs[1].kind(), SegmentKind::Wildcard);
+        assert_eq!(segs[1].decoded(), "**");
+        assert_eq!(segs[2].kind(), SegmentKind::Literal);
+        assert_eq!(segs[2].decoded(), "c");
+        assert_eq!(segs[3].kind(), SegmentKind::Wildcard);
+        assert_eq!(segs[3].decoded(), "?");
+        assert_eq!(segs[4].kind(), SegmentKind::Literal);
+        assert_eq!(segs[4].decoded(), "d");
+    }
+
+    #[test]
+    fn test_pattern_index_literal_run_grouping() {
+        // Consecutive literal characters are grouped into a single segment.
+        let pattern = Pattern::new("abc").unwrap();
+        let index = pattern.index();
+        let segs = index.segments();
+
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].kind(), SegmentKind::Literal);
+        assert_eq!(segs[0].start(), 0);
+        assert_eq!(segs[0].end(), 3);
+        assert_eq!(segs[0].decoded(), "abc");
+    }
+
+    #[test]
+    fn test_pattern_index_edit_non_literal_fails() {
+        let pattern = Pattern::new("a\\*/[x*]/b?").unwrap();
+        let index = pattern.index();
+
+        // Segment 1 is an escape, not a literal; editing it must fail.
+        assert!(index.edit_literal(1, "x").is_err());
+
+        // Segment 3 is a char class, not a literal; editing it must fail.
+        assert!(index.edit_literal(3, "x").is_err());
+
+        // Segment 5 is a wildcard, not a literal; editing it must fail.
+        assert!(index.edit_literal(5, "x").is_err());
+
+        // Out-of-bounds segment index must fail.
+        assert!(index.edit_literal(100, "x").is_err());
+    }
+
+    #[test]
+    fn test_pattern_index_empty() {
+        let pattern = Pattern::new("").unwrap();
+        let index = pattern.index();
+        assert_eq!(index.baseline(), "");
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+        assert!(index.verify(&pattern));
     }
 }
