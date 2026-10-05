@@ -66,6 +66,8 @@
 #[cfg(test)]
 doc_comment::doctest!("../README.md");
 
+pub mod diff;
+
 use std::cmp;
 use std::cmp::Ordering;
 use std::error::Error;
